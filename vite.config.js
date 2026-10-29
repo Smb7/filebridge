@@ -1,6 +1,6 @@
-import { defineConfig } from "vite";
-import { sveltekit } from "@sveltejs/kit/vite";
 import process from "node:process";
+import { sveltekit } from "@sveltejs/kit/vite";
+import { defineConfig } from "vite";
 
 const host = process.env.TAURI_DEV_HOST;
 

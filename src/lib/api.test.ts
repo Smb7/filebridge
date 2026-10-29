@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAppError } from "./api";
+import { blankToNull, isAppError, keyPathForMethod } from "./api";
 
 describe("isAppError", () => {
   it("accepts a code and a display message", () => {
@@ -16,5 +16,22 @@ describe("isAppError", () => {
     expect(isAppError({ code: 1, message: "Authentication failed" })).toBe(
       false,
     );
+  });
+});
+
+describe("connection form helpers", () => {
+  it("sends a key path only for key file authentication", () => {
+    expect(keyPathForMethod("key_file", " /home/ubuntu/.ssh/id_ed25519 ")).toBe(
+      "/home/ubuntu/.ssh/id_ed25519",
+    );
+    expect(keyPathForMethod("password", "/home/ubuntu/.ssh/id_ed25519")).toBe(
+      null,
+    );
+    expect(keyPathForMethod("key_file", "  ")).toBe(null);
+  });
+
+  it("turns blank optional fields into null", () => {
+    expect(blankToNull("  ")).toBe(null);
+    expect(blankToNull(" /etc/telegraf ")).toBe("/etc/telegraf");
   });
 });
