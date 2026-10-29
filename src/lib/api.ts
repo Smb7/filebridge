@@ -88,3 +88,103 @@ export function connectionsSave(draft: ConnectionDraft): Promise<Connection> {
 export function connectionsDelete(id: string): Promise<void> {
   return command("connections_delete", { id });
 }
+
+export type VaultMode = "uninitialized" | "keychain" | "password";
+
+export type VaultStatus = {
+  mode: VaultMode;
+  locked: boolean;
+};
+
+export type CredentialSecret = {
+  password?: string | null;
+  privateKeyPem?: string | null;
+  passphrase?: string | null;
+};
+
+export function vaultStatus(): Promise<VaultStatus> {
+  return command("vault_status");
+}
+
+export function vaultInitPassword(password: string): Promise<void> {
+  return command("vault_init_password", { password });
+}
+
+export function vaultUnlock(password: string | null): Promise<void> {
+  return command("vault_unlock", { password });
+}
+
+export function vaultSetCredential(
+  connectionId: string,
+  secret: CredentialSecret,
+): Promise<void> {
+  return command("vault_set_credential", { connectionId, secret });
+}
+
+export function vaultClearCredential(connectionId: string): Promise<void> {
+  return command("vault_clear_credential", { connectionId });
+}
+
+export function vaultHasCredential(connectionId: string): Promise<boolean> {
+  return command("vault_has_credential", { connectionId });
+}
+
+export type CredentialWrite =
+  | { action: "refuse"; message: string }
+  | { action: "clear" }
+  | { action: "set" }
+  | { action: "keep" };
+
+export function planCredentialWrite(input: {
+  locked: boolean;
+  methodChanged: boolean;
+  authMethod: AuthMethod;
+  hasSecret: boolean;
+}): CredentialWrite {
+  if (input.locked && input.hasSecret) {
+    return {
+      action: "refuse",
+      message: "Unlock the vault before saving a password or key.",
+    };
+  }
+  if (input.locked && input.methodChanged) {
+    return {
+      action: "refuse",
+      message: "Unlock the vault before changing authentication.",
+    };
+  }
+  if (
+    !input.locked &&
+    (input.authMethod === "agent" || (input.methodChanged && !input.hasSecret))
+  ) {
+    return { action: "clear" };
+  }
+  if (input.hasSecret) {
+    return { action: "set" };
+  }
+  return { action: "keep" };
+}
+
+export function secretFromFields(
+  authMethod: AuthMethod,
+  password: string,
+  privateKeyPem: string,
+  passphrase: string,
+): CredentialSecret | null {
+  const secret: CredentialSecret = {};
+  if (authMethod === "password" && password.trim() !== "") {
+    secret.password = password;
+  }
+  if (authMethod === "private_key" && privateKeyPem.trim() !== "") {
+    secret.privateKeyPem = privateKeyPem;
+  }
+  if (
+    (authMethod === "private_key" || authMethod === "key_file") &&
+    passphrase.trim() !== ""
+  ) {
+    secret.passphrase = passphrase;
+  }
+  return secret.password || secret.privateKeyPem || secret.passphrase
+    ? secret
+    : null;
+}

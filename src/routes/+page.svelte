@@ -7,8 +7,17 @@
     connectionsSave,
     isAppError,
     keyPathForMethod,
+    planCredentialWrite,
+    secretFromFields,
+    vaultClearCredential,
+    vaultHasCredential,
+    vaultInitPassword,
+    vaultSetCredential,
+    vaultStatus,
+    vaultUnlock,
     type AuthMethod,
     type Connection,
+    type VaultMode,
   } from "$lib/api";
 
   const methods: { value: AuthMethod; label: string }[] = [
@@ -28,6 +37,15 @@
   let keyPath = $state("");
   let defaultPath = $state("");
   let notes = $state("");
+  let password = $state("");
+  let privateKeyPem = $state("");
+  let passphrase = $state("");
+  let hasCredential = $state(false);
+  let savedMethod = $state<AuthMethod | null>(null);
+  let vaultMode = $state<VaultMode>("uninitialized");
+  let locked = $state(true);
+  let masterPassword = $state("");
+  let confirmPassword = $state("");
   let errorMessage = $state("");
   let busy = $state(false);
 
@@ -41,6 +59,23 @@
     keyPath = connection.keyPath ?? "";
     defaultPath = connection.defaultPath ?? "";
     notes = connection.notes ?? "";
+    savedMethod = connection.authMethod;
+    password = "";
+    privateKeyPem = "";
+    passphrase = "";
+    void loadCredential(connection.id);
+  }
+
+  async function loadCredential(id: string) {
+    if (locked) {
+      hasCredential = false;
+      return;
+    }
+    try {
+      hasCredential = await vaultHasCredential(id);
+    } catch {
+      hasCredential = false;
+    }
   }
 
   function clearForm() {
@@ -53,6 +88,11 @@
     keyPath = "";
     defaultPath = "";
     notes = "";
+    password = "";
+    privateKeyPem = "";
+    passphrase = "";
+    hasCredential = false;
+    savedMethod = null;
   }
 
   async function refresh() {
@@ -63,15 +103,91 @@
     errorMessage = isAppError(error) ? error.message : "The request failed.";
   }
 
+  async function refreshVault() {
+    let unlockError: unknown = null;
+    try {
+      await vaultUnlock(null);
+    } catch (error) {
+      if (!isAppError(error) || error.code !== "password_required") {
+        unlockError = error;
+      }
+    }
+    const status = await vaultStatus();
+    vaultMode = status.mode;
+    locked = status.locked;
+    if (unlockError && locked) {
+      showError(unlockError);
+    }
+  }
+
   onMount(() => {
-    refresh().catch(showError);
+    refresh()
+      .then(() => refreshVault())
+      .catch(showError);
   });
+
+  async function unlock(event: SubmitEvent) {
+    event.preventDefault();
+    errorMessage = "";
+    busy = true;
+    try {
+      if (vaultMode === "keychain") {
+        await vaultUnlock(null);
+      } else if (vaultMode === "uninitialized") {
+        if (masterPassword !== confirmPassword) {
+          errorMessage = "Passwords do not match.";
+          return;
+        }
+        await vaultInitPassword(masterPassword);
+        vaultMode = "password";
+      } else {
+        await vaultUnlock(masterPassword);
+      }
+      locked = false;
+      masterPassword = "";
+      confirmPassword = "";
+      if (selectedId) {
+        await loadCredential(selectedId);
+      }
+    } catch (error) {
+      if (isAppError(error) && error.code === "already_initialized") {
+        vaultMode = "password";
+        errorMessage =
+          "The vault is already set up. Enter the master password to unlock.";
+        return;
+      }
+      if (isAppError(error) && error.code === "keychain_available") {
+        await refreshVault();
+        return;
+      }
+      showError(error);
+    } finally {
+      busy = false;
+    }
+  }
 
   async function save(event: SubmitEvent) {
     event.preventDefault();
     errorMessage = "";
     busy = true;
     try {
+      const secret = secretFromFields(
+        authMethod,
+        password,
+        privateKeyPem,
+        passphrase,
+      );
+      const methodChanged = savedMethod !== null && savedMethod !== authMethod;
+      const plan = planCredentialWrite({
+        locked,
+        methodChanged,
+        authMethod,
+        hasSecret: secret !== null,
+      });
+      if (plan.action === "refuse") {
+        errorMessage = plan.message;
+        return;
+      }
       const saved = await connectionsSave({
         id: selectedId ?? undefined,
         name,
@@ -83,8 +199,41 @@
         defaultPath: blankToNull(defaultPath),
         notes: blankToNull(notes),
       });
+      selectedId = saved.id;
+      savedMethod = saved.authMethod;
       await refresh();
+      if (plan.action === "clear") {
+        await vaultClearCredential(saved.id).catch((error) => {
+          if (!isAppError(error) || error.code !== "not_found") {
+            throw error;
+          }
+        });
+      } else if (plan.action === "set" && secret) {
+        await vaultSetCredential(saved.id, secret);
+      }
+      password = "";
+      privateKeyPem = "";
+      passphrase = "";
       fill(saved);
+    } catch (error) {
+      showError(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function clearSecret() {
+    if (!selectedId) {
+      return;
+    }
+    errorMessage = "";
+    busy = true;
+    try {
+      await vaultClearCredential(selectedId);
+      hasCredential = false;
+      password = "";
+      privateKeyPem = "";
+      passphrase = "";
     } catch (error) {
       showError(error);
     } finally {
@@ -142,67 +291,174 @@
     {/if}
   </section>
 
-  <form onsubmit={save}>
-    <h2>{selectedId ? "Edit connection" : "New connection"}</h2>
-    <p class="hint">Passwords and private keys are not saved in this step.</p>
+  <div class="editor">
+    {#if locked}
+      <form class="vault" onsubmit={unlock}>
+        <h2>
+          {vaultMode === "uninitialized"
+            ? "Create a vault password"
+            : vaultMode === "keychain"
+              ? "Keychain unavailable"
+              : "Unlock vault"}
+        </h2>
+        <p class="hint">
+          {vaultMode === "keychain"
+            ? "The system keychain could not be opened. Saved secrets stay locked until it is available."
+            : "Saved passwords and keys stay encrypted on this computer."}
+        </p>
+        {#if vaultMode !== "keychain"}
+          <label>
+            Master password
+            <input
+              type="password"
+              bind:value={masterPassword}
+              autocomplete={vaultMode === "uninitialized"
+                ? "new-password"
+                : "current-password"}
+              required
+            />
+          </label>
+          {#if vaultMode === "uninitialized"}
+            <label>
+              Confirm password
+              <input
+                type="password"
+                bind:value={confirmPassword}
+                autocomplete="new-password"
+                required
+              />
+            </label>
+          {/if}
+        {/if}
+        <button type="submit" disabled={busy}>
+          {vaultMode === "uninitialized"
+            ? "Create vault"
+            : vaultMode === "keychain"
+              ? "Retry"
+              : "Unlock"}
+        </button>
+      </form>
+    {/if}
 
-    <label>
-      Name
-      <input bind:value={name} autocomplete="off" required />
-    </label>
-    <label>
-      Host
-      <input bind:value={host} autocomplete="off" spellcheck="false" required />
-    </label>
-    <label>
-      Port
-      <input bind:value={port} type="number" min="1" max="65535" required />
-    </label>
-    <label>
-      Username
-      <input
-        bind:value={username}
-        autocomplete="off"
-        spellcheck="false"
-        required
-      />
-    </label>
-    <label>
-      Authentication
-      <select bind:value={authMethod}>
-        {#each methods as method (method.value)}
-          <option value={method.value}>{method.label}</option>
-        {/each}
-      </select>
-    </label>
-    {#if authMethod === "key_file"}
+    <form onsubmit={save}>
+      <h2>{selectedId ? "Edit connection" : "New connection"}</h2>
+      <p class="hint">
+        {#if hasCredential}
+          A secret is saved. Leave the fields blank to keep it, or type a
+          replacement.
+        {:else if locked}
+          Unlock the vault before saving a password or key.
+        {:else}
+          Passwords and private keys are encrypted in the local vault.
+        {/if}
+      </p>
+
       <label>
-        Key file path
-        <input bind:value={keyPath} autocomplete="off" spellcheck="false" />
+        Name
+        <input bind:value={name} autocomplete="off" required />
       </label>
-    {/if}
-    <label>
-      Default remote path
-      <input bind:value={defaultPath} autocomplete="off" spellcheck="false" />
-    </label>
-    <label>
-      Notes
-      <textarea bind:value={notes} rows="4"></textarea>
-    </label>
-
-    {#if errorMessage}
-      <p class="error" role="alert">{errorMessage}</p>
-    {/if}
-
-    <div class="actions">
-      <button type="submit" disabled={busy}>Save</button>
-      {#if selectedId}
-        <button type="button" class="danger" disabled={busy} onclick={remove}
-          >Delete</button
-        >
+      <label>
+        Host
+        <input
+          bind:value={host}
+          autocomplete="off"
+          spellcheck="false"
+          required
+        />
+      </label>
+      <label>
+        Port
+        <input bind:value={port} type="number" min="1" max="65535" required />
+      </label>
+      <label>
+        Username
+        <input
+          bind:value={username}
+          autocomplete="off"
+          spellcheck="false"
+          required
+        />
+      </label>
+      <label>
+        Authentication
+        <select bind:value={authMethod}>
+          {#each methods as method (method.value)}
+            <option value={method.value}>{method.label}</option>
+          {/each}
+        </select>
+      </label>
+      {#if authMethod === "key_file"}
+        <label>
+          Key file path
+          <input bind:value={keyPath} autocomplete="off" spellcheck="false" />
+        </label>
       {/if}
-    </div>
-  </form>
+      {#if authMethod === "password"}
+        <label>
+          Password
+          <input
+            type="password"
+            bind:value={password}
+            autocomplete="new-password"
+            disabled={locked}
+            placeholder={hasCredential ? "Saved — type to replace" : ""}
+          />
+        </label>
+      {/if}
+      {#if authMethod === "private_key"}
+        <label>
+          Private key
+          <textarea
+            bind:value={privateKeyPem}
+            rows="6"
+            spellcheck="false"
+            disabled={locked}
+            placeholder={hasCredential
+              ? "Saved — paste a new key to replace"
+              : ""}
+          ></textarea>
+        </label>
+      {/if}
+      {#if authMethod === "private_key" || authMethod === "key_file"}
+        <label>
+          Key passphrase
+          <input
+            type="password"
+            bind:value={passphrase}
+            autocomplete="new-password"
+            disabled={locked}
+            placeholder={hasCredential ? "Saved — type to replace" : ""}
+          />
+        </label>
+      {/if}
+      <label>
+        Default remote path
+        <input bind:value={defaultPath} autocomplete="off" spellcheck="false" />
+      </label>
+      <label>
+        Notes
+        <textarea bind:value={notes} rows="4"></textarea>
+      </label>
+
+      {#if errorMessage}
+        <p class="error" role="alert">{errorMessage}</p>
+      {/if}
+
+      <div class="actions">
+        <button type="submit" disabled={busy}>Save</button>
+        {#if selectedId && hasCredential && !locked}
+          <button type="button" disabled={busy} onclick={clearSecret}
+            >Remove secret</button
+          >
+        {/if}
+        {#if selectedId}
+          <button type="button" class="danger" disabled={busy} onclick={remove}
+            >Delete</button
+          >
+        {/if}
+      </div>
+    </form>
+  </div>
 </main>
 
 <style>
@@ -223,6 +479,10 @@
   .list {
     border-right: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
     padding: 1rem;
+  }
+
+  .editor {
+    min-width: 0;
   }
 
   header,

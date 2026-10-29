@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { blankToNull, isAppError, keyPathForMethod } from "./api";
+import {
+  blankToNull,
+  isAppError,
+  keyPathForMethod,
+  planCredentialWrite,
+  secretFromFields,
+} from "./api";
 
 describe("isAppError", () => {
   it("accepts a code and a display message", () => {
@@ -33,5 +39,67 @@ describe("connection form helpers", () => {
   it("turns blank optional fields into null", () => {
     expect(blankToNull("  ")).toBe(null);
     expect(blankToNull(" /etc/telegraf ")).toBe("/etc/telegraf");
+  });
+
+  it("does not send a secret unless the user typed one", () => {
+    expect(secretFromFields("password", "  ", "", "")).toBe(null);
+    expect(secretFromFields("agent", "hunter2", "key", "pass")).toBe(null);
+    expect(secretFromFields("password", "hunter2", "ignored", "")).toEqual({
+      password: "hunter2",
+    });
+    expect(secretFromFields("private_key", "", "ignored-key", "")).toEqual({
+      privateKeyPem: "ignored-key",
+    });
+  });
+});
+
+describe("planCredentialWrite", () => {
+  it("refuses secret changes while the vault is locked", () => {
+    expect(
+      planCredentialWrite({
+        locked: true,
+        methodChanged: false,
+        authMethod: "password",
+        hasSecret: true,
+      }),
+    ).toEqual({
+      action: "refuse",
+      message: "Unlock the vault before saving a password or key.",
+    });
+    expect(
+      planCredentialWrite({
+        locked: true,
+        methodChanged: true,
+        authMethod: "agent",
+        hasSecret: false,
+      }).action,
+    ).toBe("refuse");
+  });
+
+  it("clears a secret when authentication no longer uses one", () => {
+    expect(
+      planCredentialWrite({
+        locked: false,
+        methodChanged: true,
+        authMethod: "agent",
+        hasSecret: false,
+      }),
+    ).toEqual({ action: "clear" });
+    expect(
+      planCredentialWrite({
+        locked: false,
+        methodChanged: false,
+        authMethod: "password",
+        hasSecret: false,
+      }),
+    ).toEqual({ action: "keep" });
+    expect(
+      planCredentialWrite({
+        locked: false,
+        methodChanged: false,
+        authMethod: "password",
+        hasSecret: true,
+      }),
+    ).toEqual({ action: "set" });
   });
 });
