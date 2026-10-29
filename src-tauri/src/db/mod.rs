@@ -1,5 +1,8 @@
 mod migrate;
 
+#[cfg(test)]
+pub(crate) use migrate::migrate as apply_migrations;
+
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -54,6 +57,19 @@ pub fn latest_schema_version() -> String {
 }
 
 impl Database {
+    pub fn with_connection<T, E>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<DbError>,
+    {
+        let connection = self.connection.lock().map_err(|_| DbError {
+            message: "database lock poisoned".to_string(),
+        })?;
+        operation(&connection)
+    }
+
     pub fn schema_version(&self) -> Result<String, DbError> {
         let connection = self.connection.lock().map_err(|_| DbError {
             message: "database lock poisoned".to_string(),
@@ -169,7 +185,12 @@ mod tests {
             .expect("count migrations");
         drop(connection);
 
-        assert_eq!(migration_count, 1);
+        assert_eq!(
+            migration_count,
+            super::latest_schema_version()
+                .parse::<i64>()
+                .expect("schema version")
+        );
     }
 
     #[cfg(unix)]

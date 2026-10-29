@@ -1,6 +1,9 @@
 use rusqlite::{Connection, OptionalExtension};
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../../migrations/001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../../migrations/001_init.sql")),
+    (2, include_str!("../../migrations/002_connections.sql")),
+];
 
 #[derive(Debug)]
 pub struct MigrateError {
@@ -152,8 +155,7 @@ mod tests {
             )
             .expect("read schema version");
 
-        assert_eq!(latest_version(), 1);
-        assert_eq!(migration_count, 1);
+        assert_eq!(migration_count, latest_version());
         assert_eq!(meta_count, 1);
         assert_eq!(schema_version, latest_version().to_string());
     }

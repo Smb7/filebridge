@@ -1,3 +1,4 @@
+mod connections;
 mod db;
 mod menu;
 
@@ -20,6 +21,11 @@ pub fn run() {
             app.manage(database);
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            connections::connections_list,
+            connections::connections_save,
+            connections::connections_delete,
+        ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())
         .expect("error while running FileBridge");
