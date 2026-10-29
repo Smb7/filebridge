@@ -88,3 +88,67 @@ export function connectionsSave(draft: ConnectionDraft): Promise<Connection> {
 export function connectionsDelete(id: string): Promise<void> {
   return command("connections_delete", { id });
 }
+
+export type VaultMode = "uninitialized" | "keychain" | "password";
+
+export type VaultStatus = {
+  mode: VaultMode;
+  locked: boolean;
+};
+
+export type CredentialSecret = {
+  password?: string | null;
+  privateKeyPem?: string | null;
+  passphrase?: string | null;
+};
+
+export function vaultStatus(): Promise<VaultStatus> {
+  return command("vault_status");
+}
+
+export function vaultInitPassword(password: string): Promise<void> {
+  return command("vault_init_password", { password });
+}
+
+export function vaultUnlock(password: string | null): Promise<void> {
+  return command("vault_unlock", { password });
+}
+
+export function vaultSetCredential(
+  connectionId: string,
+  secret: CredentialSecret,
+): Promise<void> {
+  return command("vault_set_credential", { connectionId, secret });
+}
+
+export function vaultClearCredential(connectionId: string): Promise<void> {
+  return command("vault_clear_credential", { connectionId });
+}
+
+export function vaultHasCredential(connectionId: string): Promise<boolean> {
+  return command("vault_has_credential", { connectionId });
+}
+
+export function secretFromFields(
+  authMethod: AuthMethod,
+  password: string,
+  privateKeyPem: string,
+  passphrase: string,
+): CredentialSecret | null {
+  const secret: CredentialSecret = {};
+  if (authMethod === "password" && password.trim() !== "") {
+    secret.password = password;
+  }
+  if (authMethod === "private_key" && privateKeyPem.trim() !== "") {
+    secret.privateKeyPem = privateKeyPem;
+  }
+  if (
+    (authMethod === "private_key" || authMethod === "key_file") &&
+    passphrase.trim() !== ""
+  ) {
+    secret.passphrase = passphrase;
+  }
+  return secret.password || secret.privateKeyPem || secret.passphrase
+    ? secret
+    : null;
+}

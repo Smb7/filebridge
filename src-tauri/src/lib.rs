@@ -1,6 +1,7 @@
 mod connections;
 mod db;
 mod menu;
+mod vault;
 
 use tauri::Manager;
 
@@ -18,6 +19,7 @@ pub fn run() {
                 ))
                 .into());
             }
+            app.manage(vault::VaultState::system());
             app.manage(database);
             Ok(())
         })
@@ -25,6 +27,12 @@ pub fn run() {
             connections::connections_list,
             connections::connections_save,
             connections::connections_delete,
+            vault::vault_status,
+            vault::vault_init_password,
+            vault::vault_unlock,
+            vault::vault_set_credential,
+            vault::vault_clear_credential,
+            vault::vault_has_credential,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())

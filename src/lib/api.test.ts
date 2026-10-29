@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { blankToNull, isAppError, keyPathForMethod } from "./api";
+import {
+  blankToNull,
+  isAppError,
+  keyPathForMethod,
+  secretFromFields,
+} from "./api";
 
 describe("isAppError", () => {
   it("accepts a code and a display message", () => {
@@ -33,5 +38,13 @@ describe("connection form helpers", () => {
   it("turns blank optional fields into null", () => {
     expect(blankToNull("  ")).toBe(null);
     expect(blankToNull(" /etc/telegraf ")).toBe("/etc/telegraf");
+  });
+
+  it("does not send a secret unless the user typed one", () => {
+    expect(secretFromFields("password", "  ", "", "")).toBe(null);
+    expect(secretFromFields("agent", "hunter2", "key", "pass")).toBe(null);
+    expect(secretFromFields("password", "hunter2", "ignored", "")).toEqual({
+      password: "hunter2",
+    });
   });
 });
