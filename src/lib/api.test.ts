@@ -3,6 +3,7 @@ import {
   blankToNull,
   isAppError,
   keyPathForMethod,
+  planCredentialWrite,
   secretFromFields,
 } from "./api";
 
@@ -46,5 +47,59 @@ describe("connection form helpers", () => {
     expect(secretFromFields("password", "hunter2", "ignored", "")).toEqual({
       password: "hunter2",
     });
+    expect(secretFromFields("private_key", "", "ignored-key", "")).toEqual({
+      privateKeyPem: "ignored-key",
+    });
+  });
+});
+
+describe("planCredentialWrite", () => {
+  it("refuses secret changes while the vault is locked", () => {
+    expect(
+      planCredentialWrite({
+        locked: true,
+        methodChanged: false,
+        authMethod: "password",
+        hasSecret: true,
+      }),
+    ).toEqual({
+      action: "refuse",
+      message: "Unlock the vault before saving a password or key.",
+    });
+    expect(
+      planCredentialWrite({
+        locked: true,
+        methodChanged: true,
+        authMethod: "agent",
+        hasSecret: false,
+      }).action,
+    ).toBe("refuse");
+  });
+
+  it("clears a secret when authentication no longer uses one", () => {
+    expect(
+      planCredentialWrite({
+        locked: false,
+        methodChanged: true,
+        authMethod: "agent",
+        hasSecret: false,
+      }),
+    ).toEqual({ action: "clear" });
+    expect(
+      planCredentialWrite({
+        locked: false,
+        methodChanged: false,
+        authMethod: "password",
+        hasSecret: false,
+      }),
+    ).toEqual({ action: "keep" });
+    expect(
+      planCredentialWrite({
+        locked: false,
+        methodChanged: false,
+        authMethod: "password",
+        hasSecret: true,
+      }),
+    ).toEqual({ action: "set" });
   });
 });

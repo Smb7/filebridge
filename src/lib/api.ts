@@ -129,6 +129,42 @@ export function vaultHasCredential(connectionId: string): Promise<boolean> {
   return command("vault_has_credential", { connectionId });
 }
 
+export type CredentialWrite =
+  | { action: "refuse"; message: string }
+  | { action: "clear" }
+  | { action: "set" }
+  | { action: "keep" };
+
+export function planCredentialWrite(input: {
+  locked: boolean;
+  methodChanged: boolean;
+  authMethod: AuthMethod;
+  hasSecret: boolean;
+}): CredentialWrite {
+  if (input.locked && input.hasSecret) {
+    return {
+      action: "refuse",
+      message: "Unlock the vault before saving a password or key.",
+    };
+  }
+  if (input.locked && input.methodChanged) {
+    return {
+      action: "refuse",
+      message: "Unlock the vault before changing authentication.",
+    };
+  }
+  if (
+    !input.locked &&
+    (input.authMethod === "agent" || (input.methodChanged && !input.hasSecret))
+  ) {
+    return { action: "clear" };
+  }
+  if (input.hasSecret) {
+    return { action: "set" };
+  }
+  return { action: "keep" };
+}
+
 export function secretFromFields(
   authMethod: AuthMethod,
   password: string,

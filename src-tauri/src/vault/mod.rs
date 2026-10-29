@@ -34,12 +34,18 @@ pub struct VaultStatus {
     pub locked: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialSecret {
     pub password: Option<String>,
     pub private_key_pem: Option<String>,
     pub passphrase: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CredentialSecret([redacted])")
+    }
 }
 
 impl Drop for CredentialSecret {
@@ -67,6 +73,7 @@ enum VaultError {
     Locked,
     PasswordRequired,
     InvalidPassword,
+    AlreadyInitialized,
     KeychainAvailable,
     Keychain,
     InvalidCredential(&'static str),
@@ -80,6 +87,9 @@ impl From<VaultError> for CommandError {
             VaultError::Locked => ("vault_locked", "Unlock the vault first."),
             VaultError::PasswordRequired => ("password_required", "A master password is required."),
             VaultError::InvalidPassword => ("invalid_password", "Incorrect password."),
+            VaultError::AlreadyInitialized => {
+                ("already_initialized", "The vault is already set up.")
+            }
             VaultError::KeychainAvailable => (
                 "keychain_available",
                 "The system keychain is available. A master password is not used.",
@@ -152,29 +162,34 @@ impl VaultState {
         if self.keystore.available() {
             return Err(VaultError::KeychainAvailable);
         }
-        if stored_mode(connection)? != VaultMode::Uninitialized {
-            return Err(VaultError::InvalidPassword);
-        }
         if password.chars().count() < 8 {
             return Err(VaultError::InvalidCredential(
                 "Master password must be at least 8 characters.",
             ));
         }
+        if stored_mode(connection)? != VaultMode::Uninitialized {
+            return Err(VaultError::AlreadyInitialized);
+        }
         let dek = crypto::random_dek().map_err(|_| VaultError::Database)?;
         let wrapped =
             crypto::wrap_dek(password, &self.kdf, &dek).map_err(|_| VaultError::Database)?;
-        set_meta(connection, MODE_KEY, "password")?;
-        set_meta(connection, SALT_KEY, &BASE64.encode(&wrapped.salt))?;
+        let transaction = connection.unchecked_transaction()?;
+        if stored_mode(&transaction)? != VaultMode::Uninitialized {
+            return Err(VaultError::AlreadyInitialized);
+        }
+        set_meta(&transaction, MODE_KEY, "password")?;
+        set_meta(&transaction, SALT_KEY, &BASE64.encode(&wrapped.salt))?;
         set_meta(
-            connection,
+            &transaction,
             WRAPPED_KEY,
             &BASE64.encode(join_nonce(&wrapped.nonce, &wrapped.ciphertext)),
         )?;
         set_meta(
-            connection,
+            &transaction,
             PARAMS_KEY,
             &serde_json::to_string(&self.kdf).map_err(|_| VaultError::Database)?,
         )?;
+        transaction.commit()?;
         self.store_dek(dek)?;
         Ok(())
     }
@@ -190,9 +205,12 @@ impl VaultState {
             }
             VaultMode::Password => {
                 let password = password.ok_or(VaultError::PasswordRequired)?;
-                let wrapped = read_wrapped(connection)?;
-                let dek = crypto::unwrap_dek(password, &self.kdf, &wrapped)
+                let (wrapped, params) = read_wrapped(connection)?;
+                let dek = crypto::unwrap_dek(password, &params, &wrapped)
                     .map_err(|_| VaultError::InvalidPassword)?;
+                if dek.len() != 32 {
+                    return Err(VaultError::InvalidPassword);
+                }
                 self.store_dek(dek)
             }
             VaultMode::Uninitialized => Err(VaultError::PasswordRequired),
@@ -203,9 +221,6 @@ impl VaultState {
         if !self.keystore.available() {
             return Err(VaultError::Keychain);
         }
-        if stored_mode(connection)? != VaultMode::Keychain {
-            set_meta(connection, MODE_KEY, "keychain")?;
-        }
         let dek = match self.keystore.get_dek()? {
             Some(dek) if dek.len() == 32 => dek,
             Some(_) => return Err(VaultError::Keychain),
@@ -215,6 +230,9 @@ impl VaultState {
                 dek
             }
         };
+        if stored_mode(connection)? != VaultMode::Keychain {
+            set_meta(connection, MODE_KEY, "keychain")?;
+        }
         self.store_dek(dek)
     }
 
@@ -226,8 +244,9 @@ impl VaultState {
     ) -> Result<(), VaultError> {
         let dek = self.current_dek()?;
         let method = auth_method(connection, connection_id)?;
-        let payload = payload_for(method, secret)?;
-        let json = serde_json::to_vec(&payload).map_err(|_| VaultError::Database)?;
+        let secret = fill_omitted_key_fields(connection, connection_id, method, secret, &dek)?;
+        let payload = payload_for(method, &secret)?;
+        let json = Zeroizing::new(serde_json::to_vec(&payload).map_err(|_| VaultError::Database)?);
         let (nonce, ciphertext) = crypto::encrypt(&dek, &json).map_err(|_| VaultError::Database)?;
         connection.execute(
             "INSERT INTO credential_blobs (connection_id, nonce, ciphertext, updated_at)
@@ -286,14 +305,81 @@ impl VaultState {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Payload {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     password: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     private_key_pem: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     passphrase: Option<String>,
+}
+
+impl Drop for Payload {
+    fn drop(&mut self) {
+        zeroize_opt(&mut self.password);
+        zeroize_opt(&mut self.private_key_pem);
+        zeroize_opt(&mut self.passphrase);
+    }
+}
+
+fn zeroize_opt(value: &mut Option<String>) {
+    if let Some(value) = value {
+        value.zeroize();
+    }
+}
+
+fn is_blank(value: Option<&str>) -> bool {
+    value.map(str::trim).unwrap_or("").is_empty()
+}
+
+fn fill_omitted_key_fields(
+    connection: &Connection,
+    connection_id: &str,
+    method: AuthMethod,
+    secret: &CredentialSecret,
+    dek: &[u8],
+) -> Result<CredentialSecret, VaultError> {
+    if method != AuthMethod::PrivateKey {
+        return Ok(secret.clone());
+    }
+    if !is_blank(secret.private_key_pem.as_deref()) && !is_blank(secret.passphrase.as_deref()) {
+        return Ok(secret.clone());
+    }
+    let Some(mut existing) = read_payload(connection, connection_id, dek)? else {
+        return Ok(secret.clone());
+    };
+    if existing.private_key_pem.is_none() {
+        return Ok(secret.clone());
+    }
+    let mut filled = secret.clone();
+    if is_blank(filled.private_key_pem.as_deref()) {
+        filled.private_key_pem = existing.private_key_pem.take();
+    }
+    if is_blank(filled.passphrase.as_deref()) {
+        filled.passphrase = existing.passphrase.take();
+    }
+    Ok(filled)
+}
+
+fn read_payload(
+    connection: &Connection,
+    connection_id: &str,
+    dek: &[u8],
+) -> Result<Option<Payload>, VaultError> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT nonce, ciphertext FROM credential_blobs WHERE connection_id = ?1",
+            [connection_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((nonce, ciphertext)) = row else {
+        return Ok(None);
+    };
+    let plaintext = crypto::decrypt(dek, &nonce, &ciphertext).map_err(|_| VaultError::Database)?;
+    let payload = serde_json::from_slice(&plaintext).map_err(|_| VaultError::Database)?;
+    Ok(Some(payload))
 }
 
 fn payload_for(method: AuthMethod, secret: &CredentialSecret) -> Result<Payload, VaultError> {
@@ -309,10 +395,15 @@ fn payload_for(method: AuthMethod, secret: &CredentialSecret) -> Result<Payload,
                     "A password connection cannot store a private key.",
                 ));
             }
+            if passphrase.is_some() {
+                return Err(VaultError::InvalidCredential(
+                    "A password connection cannot store a key passphrase.",
+                ));
+            }
             Ok(Payload {
                 password: Some(password),
                 private_key_pem: None,
-                passphrase,
+                passphrase: None,
             })
         }
         AuthMethod::PrivateKey => {
@@ -380,21 +471,34 @@ fn stored_mode(connection: &Connection) -> Result<VaultMode, VaultError> {
     }
 }
 
-fn read_wrapped(connection: &Connection) -> Result<WrappedDek, VaultError> {
+fn read_wrapped(connection: &Connection) -> Result<(WrappedDek, KdfParams), VaultError> {
     let salt = decode_meta(connection, SALT_KEY)?;
     let packed = decode_meta(connection, WRAPPED_KEY)?;
-    if packed.len() < 13 {
+    if salt.len() < 8 || packed.len() < 13 {
         return Err(VaultError::Database);
     }
-    let stored: KdfParams =
-        serde_json::from_str(&meta(connection, PARAMS_KEY)?.unwrap_or_default())
-            .map_err(|_| VaultError::Database)?;
-    let _ = stored;
-    Ok(WrappedDek {
-        salt,
-        nonce: packed[..12].to_vec(),
-        ciphertext: packed[12..].to_vec(),
-    })
+    let stored = meta(connection, PARAMS_KEY)?.ok_or(VaultError::Database)?;
+    let params: KdfParams = serde_json::from_str(&stored).map_err(|_| VaultError::Database)?;
+    if !accepted_kdf(&params) {
+        return Err(VaultError::Database);
+    }
+    Ok((
+        WrappedDek {
+            salt,
+            nonce: packed[..12].to_vec(),
+            ciphertext: packed[12..].to_vec(),
+        },
+        params,
+    ))
+}
+
+fn accepted_kdf(params: &KdfParams) -> bool {
+    params.parallelism >= 1
+        && params.parallelism <= 4
+        && params.iterations >= 1
+        && params.iterations <= 64
+        && params.memory_kib >= 8 * params.parallelism
+        && params.memory_kib <= 262_144
 }
 
 fn decode_meta(connection: &Connection, key: &str) -> Result<Vec<u8>, VaultError> {
@@ -461,14 +565,12 @@ pub fn vault_init_password(
     vault: tauri::State<'_, VaultState>,
     password: String,
 ) -> Result<(), CommandError> {
-    let mut password = password;
-    let result = database.with_connection(|connection| {
+    let password = Zeroizing::new(password);
+    database.with_connection(|connection| {
         vault
             .init_password_on(connection, &password)
             .map_err(CommandError::from)
-    });
-    password.zeroize();
-    result
+    })
 }
 
 #[tauri::command]
@@ -477,16 +579,12 @@ pub fn vault_unlock(
     vault: tauri::State<'_, VaultState>,
     password: Option<String>,
 ) -> Result<(), CommandError> {
-    let mut password = password;
-    let result = database.with_connection(|connection| {
+    let password = password.map(Zeroizing::new);
+    database.with_connection(|connection| {
         vault
-            .unlock_on(connection, password.as_deref())
+            .unlock_on(connection, password.as_deref().map(String::as_str))
             .map_err(CommandError::from)
-    });
-    if let Some(value) = &mut password {
-        value.zeroize();
-    }
-    result
+    })
 }
 
 #[tauri::command]
@@ -673,5 +771,212 @@ mod tests {
                 .set_credential_on(&connection, "conn-1", &secret)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unlock_uses_the_stored_kdf_params() {
+        let connection = open_db();
+        let stored = super::crypto::KdfParams {
+            memory_kib: 16,
+            iterations: 2,
+            parallelism: 1,
+        };
+        let writer = VaultState::new(Box::new(MemoryKeyStore::unavailable()), stored);
+        writer
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+
+        let reader = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        reader
+            .unlock_on(&connection, Some("correct horse"))
+            .expect("stored params unlock a different process kdf");
+    }
+
+    #[test]
+    fn absurd_kdf_params_are_rejected_before_derivation() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        vault
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+        connection
+            .execute(
+                "UPDATE app_meta SET value = ?1 WHERE key = 'kdf_params'",
+                [r#"{"memory_kib":300000,"iterations":1,"parallelism":1}"#],
+            )
+            .expect("corrupt params");
+        let locked = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        assert!(
+            locked
+                .unlock_on(&connection, Some("correct horse"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn password_init_is_refused_when_a_keystore_is_available() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::available()), test_kdf());
+        assert!(
+            vault
+                .init_password_on(&connection, "correct horse")
+                .is_err()
+        );
+        assert_eq!(
+            vault.status_on(&connection).expect("status").mode,
+            VaultMode::Uninitialized
+        );
+    }
+
+    #[test]
+    fn a_second_password_init_does_not_look_like_a_bad_password() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        vault
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+        let error = vault
+            .init_password_on(&connection, "another horse")
+            .expect_err("second init");
+        let command = super::CommandError::from(error);
+        assert_eq!(command.code, "already_initialized");
+    }
+
+    #[test]
+    fn keychain_reuses_the_existing_dek() {
+        let connection = open_db();
+        let store = std::sync::Arc::new(MemoryKeyStore::available());
+        let first = VaultState::new(Box::new(SharedStore(store.clone())), test_kdf());
+        first.unlock_on(&connection, None).expect("first unlock");
+        insert_connection(&connection, "conn-1", "password");
+        let secret = super::CredentialSecret {
+            password: Some("hunter2-secret".to_string()),
+            private_key_pem: None,
+            passphrase: None,
+        };
+        first
+            .set_credential_on(&connection, "conn-1", &secret)
+            .expect("set");
+
+        let second = VaultState::new(Box::new(SharedStore(store)), test_kdf());
+        second.unlock_on(&connection, None).expect("second unlock");
+        let dek = second.current_dek().expect("dek");
+        let payload = super::read_payload(&connection, "conn-1", &dek)
+            .expect("decrypt")
+            .expect("payload");
+        assert_eq!(payload.password.as_deref(), Some("hunter2-secret"));
+    }
+
+    #[test]
+    fn omitted_private_key_fields_keep_the_saved_secret() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        vault
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+        insert_connection(&connection, "conn-1", "private_key");
+        vault
+            .set_credential_on(
+                &connection,
+                "conn-1",
+                &super::CredentialSecret {
+                    password: None,
+                    private_key_pem: Some("-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n".to_string()),
+                    passphrase: Some("fixture-a".to_string()),
+                },
+            )
+            .expect("set both");
+        vault
+            .set_credential_on(
+                &connection,
+                "conn-1",
+                &super::CredentialSecret {
+                    password: None,
+                    private_key_pem: None,
+                    passphrase: Some("fixture-b".to_string()),
+                },
+            )
+            .expect("replace passphrase only");
+
+        let dek = vault.current_dek().expect("dek");
+        let payload = super::read_payload(&connection, "conn-1", &dek)
+            .expect("decrypt")
+            .expect("payload");
+        assert_eq!(
+            payload.private_key_pem.as_deref(),
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----\nkey")
+        );
+        assert_eq!(payload.passphrase.as_deref(), Some("fixture-b"));
+        assert!(payload.password.is_none());
+    }
+
+    #[test]
+    fn secrets_must_match_the_auth_method() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        vault
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+        insert_connection(&connection, "conn-1", "agent");
+        let rejected = vault.set_credential_on(
+            &connection,
+            "conn-1",
+            &super::CredentialSecret {
+                password: Some("hunter2-secret".to_string()),
+                private_key_pem: None,
+                passphrase: None,
+            },
+        );
+        assert!(rejected.is_err());
+        assert!(!vault.has_credential_on(&connection, "conn-1").expect("has"));
+    }
+
+    #[test]
+    fn deleting_a_connection_removes_its_credential_blob() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        vault
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+        insert_connection(&connection, "conn-1", "password");
+        vault
+            .set_credential_on(
+                &connection,
+                "conn-1",
+                &super::CredentialSecret {
+                    password: Some("hunter2-secret".to_string()),
+                    private_key_pem: None,
+                    passphrase: None,
+                },
+            )
+            .expect("set");
+        connection
+            .execute("DELETE FROM connections WHERE id = 'conn-1'", [])
+            .expect("delete");
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM credential_blobs", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(remaining, 0);
+    }
+
+    struct SharedStore(std::sync::Arc<MemoryKeyStore>);
+
+    impl crate::vault::keystore::KeyStore for SharedStore {
+        fn available(&self) -> bool {
+            self.0.available()
+        }
+
+        fn get_dek(
+            &self,
+        ) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, crate::vault::keystore::KeyStoreError>
+        {
+            self.0.get_dek()
+        }
+
+        fn set_dek(&self, dek: &[u8]) -> Result<(), crate::vault::keystore::KeyStoreError> {
+            self.0.set_dek(dek)
+        }
     }
 }

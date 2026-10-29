@@ -67,7 +67,12 @@ impl KeyStore for OsKeyStore {
             return false;
         };
         match entry.get_secret() {
-            Ok(_) | Err(keyring::Error::NoEntry) => true,
+            Ok(secret) => {
+                // A successful probe returns the DEK. Drop it through Zeroizing.
+                let _secret = Zeroizing::new(secret);
+                true
+            }
+            Err(keyring::Error::NoEntry) => true,
             Err(_) => false,
         }
     }
@@ -84,5 +89,20 @@ impl KeyStore for OsKeyStore {
     fn set_dek(&self, dek: &[u8]) -> Result<(), KeyStoreError> {
         let entry = keyring::Entry::new(SERVICE, ACCOUNT).map_err(|_| KeyStoreError)?;
         entry.set_secret(dek).map_err(|_| KeyStoreError)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn manifest_enables_real_platform_stores() {
+        let manifest = include_str!("../../Cargo.toml");
+        assert!(
+            manifest.contains("apple-native")
+                && manifest.contains("windows-native")
+                && manifest.contains("sync-secret-service")
+                && manifest.contains("crypto-rust"),
+            "keyring must not fall back to its in-memory mock"
+        );
     }
 }
