@@ -188,3 +188,55 @@ export function secretFromFields(
     ? secret
     : null;
 }
+
+export type HostKeyDecision = "trusted" | "unknown" | "changed";
+
+export type TrustedHost = {
+  id: string;
+  host: string;
+  port: number;
+  keyType: string;
+  fingerprint: string;
+  trustedAt: string;
+};
+
+export type HostKeyPrompt = {
+  pendingId: string;
+  host: string;
+  port: number;
+  keyType: string;
+  fingerprint: string;
+  storedFingerprint: string | null;
+  decision: HostKeyDecision;
+};
+
+export function hostKeyPromptCopy(decision: HostKeyDecision): {
+  title: string;
+  confirm: string;
+} {
+  if (decision === "changed") {
+    return {
+      title: "Host key changed",
+      confirm: "Replace trusted key",
+    };
+  }
+  return {
+    title: "Unknown host key",
+    confirm: "Trust this key",
+  };
+}
+
+export function hostkeyList(): Promise<TrustedHost[]> {
+  return command("hostkey_list");
+}
+
+export function hostkeyForget(id: string): Promise<void> {
+  return command("hostkey_forget", { id });
+}
+
+export function hostkeyConfirm(
+  pendingId: string,
+  replace: boolean,
+): Promise<TrustedHost> {
+  return command("hostkey_confirm", { pendingId, replace });
+}

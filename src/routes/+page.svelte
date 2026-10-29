@@ -1,10 +1,15 @@
 <script lang="ts">
+  import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import {
     blankToNull,
     connectionsDelete,
     connectionsList,
     connectionsSave,
+    hostKeyPromptCopy,
+    hostkeyConfirm,
+    hostkeyForget,
+    hostkeyList,
     isAppError,
     keyPathForMethod,
     planCredentialWrite,
@@ -17,6 +22,8 @@
     vaultUnlock,
     type AuthMethod,
     type Connection,
+    type HostKeyPrompt,
+    type TrustedHost,
     type VaultMode,
   } from "$lib/api";
 
@@ -48,6 +55,8 @@
   let confirmPassword = $state("");
   let errorMessage = $state("");
   let busy = $state(false);
+  let trustedHosts = $state<TrustedHost[]>([]);
+  let hostPrompt = $state<HostKeyPrompt | null>(null);
 
   function fill(connection: Connection) {
     selectedId = connection.id;
@@ -97,6 +106,7 @@
 
   async function refresh() {
     connections = await connectionsList();
+    trustedHosts = await hostkeyList();
   }
 
   function showError(error: unknown) {
@@ -121,10 +131,46 @@
   }
 
   onMount(() => {
+    const unlisten = listen<HostKeyPrompt>("hostkey://prompt", (event) => {
+      hostPrompt = event.payload;
+    });
     refresh()
       .then(() => refreshVault())
       .catch(showError);
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
   });
+
+  async function confirmHostKey(replace: boolean) {
+    if (!hostPrompt) {
+      return;
+    }
+    errorMessage = "";
+    busy = true;
+    try {
+      await hostkeyConfirm(hostPrompt.pendingId, replace);
+      hostPrompt = null;
+      await refresh();
+    } catch (error) {
+      showError(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function forgetHost(id: string) {
+    errorMessage = "";
+    busy = true;
+    try {
+      await hostkeyForget(id);
+      await refresh();
+    } catch (error) {
+      showError(error);
+    } finally {
+      busy = false;
+    }
+  }
 
   async function unlock(event: SubmitEvent) {
     event.preventDefault();
@@ -292,6 +338,59 @@
   </section>
 
   <div class="editor">
+    <section class="hosts">
+      {#if hostPrompt}
+        <div
+          class="prompt"
+          class:changed={hostPrompt.decision === "changed"}
+          role="alert"
+        >
+          <h2>{hostKeyPromptCopy(hostPrompt.decision).title}</h2>
+          <p>
+            {hostPrompt.host}:{hostPrompt.port} · {hostPrompt.keyType}
+          </p>
+          <p class="fingerprint">{hostPrompt.fingerprint}</p>
+          {#if hostPrompt.storedFingerprint}
+            <p class="hint">
+              Previously trusted: {hostPrompt.storedFingerprint}
+            </p>
+          {/if}
+          <div class="actions">
+            <button
+              type="button"
+              disabled={busy}
+              onclick={() => confirmHostKey(hostPrompt?.decision === "changed")}
+            >
+              {hostKeyPromptCopy(hostPrompt.decision).confirm}
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onclick={() => (hostPrompt = null)}>Cancel</button
+            >
+          </div>
+        </div>
+      {/if}
+      <h2>Trusted hosts</h2>
+      {#if trustedHosts.length === 0}
+        <p class="empty">No host keys trusted yet.</p>
+      {:else}
+        <ul>
+          {#each trustedHosts as host (host.id)}
+            <li>
+              <span>{host.host}:{host.port}</span>
+              <small>{host.fingerprint}</small>
+              <button
+                type="button"
+                disabled={busy}
+                onclick={() => forgetHost(host.id)}>Forget</button
+              >
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+
     {#if locked}
       <form class="vault" onsubmit={unlock}>
         <h2>
@@ -547,12 +646,36 @@
     opacity: 0.72;
   }
 
+  .hosts,
   form {
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
     padding: 1.25rem;
-    max-width: 36rem;
+    max-width: 40rem;
+  }
+
+  .prompt {
+    border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
+    border-radius: 8px;
+    padding: 0.8rem;
+  }
+
+  .prompt.changed {
+    border-color: color-mix(in srgb, red 65%, CanvasText);
+  }
+
+  .fingerprint,
+  .hosts small {
+    font-family: ui-monospace, Consolas, monospace;
+    overflow-wrap: anywhere;
+  }
+
+  .hosts li {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    margin-bottom: 0.75rem;
   }
 
   label {
