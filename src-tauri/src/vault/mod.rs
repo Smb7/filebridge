@@ -11,13 +11,19 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::connections::AuthMethod;
 use crate::db::{Database, DbError};
-use crate::vault::crypto::{KdfParams, WrappedDek, production_kdf, test_kdf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::vault::crypto::{KdfParams, WrappedDek, minimum_kdf, production_kdf, test_kdf};
 use crate::vault::keystore::{KeyStore, KeyStoreError, MemoryKeyStore, OsKeyStore};
 
 const MODE_KEY: &str = "vault_mode";
 const WRAPPED_KEY: &str = "wrapped_dek";
 const SALT_KEY: &str = "kdf_salt";
 const PARAMS_KEY: &str = "kdf_params";
+const FAILURES_KEY: &str = "vault_unlock_failures";
+const LOCKED_UNTIL_KEY: &str = "vault_unlock_locked_until";
+const LOCKOUT_AFTER: u64 = 5;
+const MAX_LOCKOUT_SECS: u64 = 900;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +79,7 @@ enum VaultError {
     Locked,
     PasswordRequired,
     InvalidPassword,
+    LockedOut,
     AlreadyInitialized,
     KeychainAvailable,
     Keychain,
@@ -87,6 +94,7 @@ impl From<VaultError> for CommandError {
             VaultError::Locked => ("vault_locked", "Unlock the vault first."),
             VaultError::PasswordRequired => ("password_required", "A master password is required."),
             VaultError::InvalidPassword => ("invalid_password", "Incorrect password."),
+            VaultError::LockedOut => ("locked_out", "Too many unlock attempts. Try again later."),
             VaultError::AlreadyInitialized => {
                 ("already_initialized", "The vault is already set up.")
             }
@@ -203,17 +211,33 @@ impl VaultState {
             VaultMode::Uninitialized if self.keystore.available() => {
                 self.unlock_keychain(connection)
             }
-            VaultMode::Password => {
-                let password = password.ok_or(VaultError::PasswordRequired)?;
-                let (wrapped, params) = read_wrapped(connection)?;
-                let dek = crypto::unwrap_dek(password, &params, &wrapped)
-                    .map_err(|_| VaultError::InvalidPassword)?;
-                if dek.len() != 32 {
-                    return Err(VaultError::InvalidPassword);
-                }
+            VaultMode::Password => self.unlock_password(connection, password),
+            VaultMode::Uninitialized => Err(VaultError::PasswordRequired),
+        }
+    }
+
+    fn unlock_password(
+        &self,
+        connection: &Connection,
+        password: Option<&str>,
+    ) -> Result<(), VaultError> {
+        if unlock_is_locked_out(connection)? {
+            return Err(VaultError::LockedOut);
+        }
+        let password = password.ok_or(VaultError::PasswordRequired)?;
+        let (wrapped, params) = read_wrapped(connection)?;
+        match crypto::unwrap_dek(password, &params, &wrapped) {
+            Ok(dek) if dek.len() == 32 => {
+                clear_unlock_failures(connection)?;
                 self.store_dek(dek)
             }
-            VaultMode::Uninitialized => Err(VaultError::PasswordRequired),
+            _ => {
+                if record_unlock_failure(connection)? {
+                    Err(VaultError::LockedOut)
+                } else {
+                    Err(VaultError::InvalidPassword)
+                }
+            }
         }
     }
 
@@ -493,12 +517,61 @@ fn read_wrapped(connection: &Connection) -> Result<(WrappedDek, KdfParams), Vaul
 }
 
 fn accepted_kdf(params: &KdfParams) -> bool {
+    let floor = minimum_kdf();
     params.parallelism >= 1
         && params.parallelism <= 4
-        && params.iterations >= 1
+        && params.iterations >= floor.iterations
         && params.iterations <= 64
-        && params.memory_kib >= 8 * params.parallelism
+        && params.memory_kib >= floor.memory_kib.max(8 * params.parallelism)
         && params.memory_kib <= 262_144
+}
+
+fn unlock_is_locked_out(connection: &Connection) -> Result<bool, VaultError> {
+    let Some(until) = meta_u64(connection, LOCKED_UNTIL_KEY)? else {
+        return Ok(false);
+    };
+    Ok(now_secs() < until)
+}
+
+fn record_unlock_failure(connection: &Connection) -> Result<bool, VaultError> {
+    let failures = meta_u64(connection, FAILURES_KEY)?.unwrap_or(0) + 1;
+    set_meta(connection, FAILURES_KEY, &failures.to_string())?;
+    if failures < LOCKOUT_AFTER {
+        return Ok(false);
+    }
+    let shift = (failures - LOCKOUT_AFTER).min(9);
+    let delay = 2u64
+        .checked_shl(shift as u32)
+        .unwrap_or(MAX_LOCKOUT_SECS)
+        .min(MAX_LOCKOUT_SECS);
+    set_meta(
+        connection,
+        LOCKED_UNTIL_KEY,
+        &(now_secs().saturating_add(delay)).to_string(),
+    )?;
+    Ok(true)
+}
+
+fn clear_unlock_failures(connection: &Connection) -> Result<(), VaultError> {
+    connection.execute(
+        "DELETE FROM app_meta WHERE key = ?1 OR key = ?2",
+        [FAILURES_KEY, LOCKED_UNTIL_KEY],
+    )?;
+    Ok(())
+}
+
+fn meta_u64(connection: &Connection, key: &str) -> Result<Option<u64>, VaultError> {
+    let Some(value) = meta(connection, key)? else {
+        return Ok(None);
+    };
+    value.parse().map(Some).map_err(|_| VaultError::Database)
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn decode_meta(connection: &Connection, key: &str) -> Result<Vec<u8>, VaultError> {
@@ -639,7 +712,7 @@ impl VaultState {
 mod tests {
     use super::{VaultMode, VaultState};
     use crate::db::apply_migrations;
-    use crate::vault::crypto::test_kdf;
+    use crate::vault::crypto::{minimum_kdf, production_kdf, test_kdf};
     use crate::vault::keystore::MemoryKeyStore;
     use rusqlite::Connection;
 
@@ -694,7 +767,7 @@ mod tests {
     #[test]
     fn password_mode_rejects_the_wrong_password_and_hides_plaintext() {
         let connection = open_db();
-        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), minimum_kdf());
         assert_eq!(
             vault.status_on(&connection).expect("status").mode,
             VaultMode::Uninitialized
@@ -776,17 +849,13 @@ mod tests {
     #[test]
     fn unlock_uses_the_stored_kdf_params() {
         let connection = open_db();
-        let stored = super::crypto::KdfParams {
-            memory_kib: 16,
-            iterations: 2,
-            parallelism: 1,
-        };
+        let stored = minimum_kdf();
         let writer = VaultState::new(Box::new(MemoryKeyStore::unavailable()), stored);
         writer
             .init_password_on(&connection, "correct horse")
             .expect("init");
 
-        let reader = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        let reader = VaultState::new(Box::new(MemoryKeyStore::unavailable()), production_kdf());
         reader
             .unlock_on(&connection, Some("correct horse"))
             .expect("stored params unlock a different process kdf");
@@ -802,15 +871,58 @@ mod tests {
         connection
             .execute(
                 "UPDATE app_meta SET value = ?1 WHERE key = 'kdf_params'",
-                [r#"{"memory_kib":300000,"iterations":1,"parallelism":1}"#],
+                [r#"{"memory_kib":8,"iterations":1,"parallelism":1}"#],
+            )
+            .expect("weaken params");
+        let locked = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
+        let weakened = locked
+            .unlock_on(&connection, Some("correct horse"))
+            .expect_err("weak params");
+        assert!(matches!(weakened, super::VaultError::Database));
+
+        connection
+            .execute(
+                "UPDATE app_meta SET value = ?1 WHERE key = 'kdf_params'",
+                [r#"{"memory_kib":300000,"iterations":2,"parallelism":1}"#],
             )
             .expect("corrupt params");
+        let oversized = locked
+            .unlock_on(&connection, Some("correct horse"))
+            .expect_err("oversized params");
+        assert!(matches!(oversized, super::VaultError::Database));
+    }
+
+    #[test]
+    fn unlock_locks_out_before_another_password_guess() {
+        let connection = open_db();
+        let vault = VaultState::new(Box::new(MemoryKeyStore::unavailable()), minimum_kdf());
+        vault
+            .init_password_on(&connection, "correct horse")
+            .expect("init");
+        connection
+            .execute(
+                "INSERT INTO app_meta (key, value) VALUES ('vault_unlock_failures', '4')",
+                [],
+            )
+            .expect("preset failures");
+
         let locked = VaultState::new(Box::new(MemoryKeyStore::unavailable()), test_kdf());
-        assert!(
-            locked
-                .unlock_on(&connection, Some("correct horse"))
-                .is_err()
-        );
+        let attempt = locked
+            .unlock_on(&connection, Some("wrong horse"))
+            .expect_err("fifth failure");
+        assert!(matches!(attempt, super::VaultError::LockedOut));
+        assert_eq!(super::CommandError::from(attempt).code, "locked_out");
+
+        connection
+            .execute(
+                "UPDATE app_meta SET value = '8' WHERE key = 'kdf_params'",
+                [],
+            )
+            .expect("weaken after lockout");
+        let blocked = locked
+            .unlock_on(&connection, Some("correct horse"))
+            .expect_err("locked out");
+        assert!(matches!(blocked, super::VaultError::LockedOut));
     }
 
     #[test]
