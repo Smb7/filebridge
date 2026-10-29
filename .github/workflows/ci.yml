@@ -26,6 +26,7 @@ jobs:
       - run: npm run format:check
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --check --manifest-path src-tauri/Cargo.toml
 
@@ -46,6 +47,7 @@ jobs:
       - run: npm run check
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
         with:
+          toolchain: stable
           components: clippy
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
@@ -69,6 +71,8 @@ jobs:
       - run: npm ci
       - run: npm test
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
   build:
@@ -90,6 +94,8 @@ jobs:
           node-version: 22
           cache: npm
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
+        with:
+          toolchain: stable
       - run: npm ci
       - run: npm run build
       - run: cargo build --manifest-path src-tauri/Cargo.toml --locked

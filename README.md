@@ -22,7 +22,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-The database is created in the OS app data directory, not in this repository.
+The database is created in the OS app data directory (`%APPDATA%\filebridge` on Windows), not in this repository.
 
 ## Reviews
 
