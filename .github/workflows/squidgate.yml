@@ -1,0 +1,28 @@
+name: SquidGate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  squidgate:
+    name: squidgate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: SquidGate
+        uses: SquidSec/SquidGate@bfc3a29742a3d6a121f9e6b9662260d704d71b8e # v1.0.0-build.28
+        with:
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+          llm-provider: opencode-go
+          llm-model: glm-5.3-flash
