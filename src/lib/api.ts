@@ -240,3 +240,44 @@ export function hostkeyConfirm(
 ): Promise<TrustedHost> {
   return command("hostkey_confirm", { pendingId, replace });
 }
+
+export type LiveSession = {
+  sessionId: string;
+  connectionId: string;
+  name: string;
+  username: string;
+  host: string;
+  port: number;
+};
+
+export function sessionForConnection(
+  sessions: LiveSession[],
+  connectionId: string,
+): LiveSession | undefined {
+  return sessions.find((session) => session.connectionId === connectionId);
+}
+
+export function isHostKeyStop(code: string): boolean {
+  return code === "host_key_unknown" || code === "host_key_changed";
+}
+
+export function sessionConnect(
+  connectionId: string,
+): Promise<{ sessionId: string }> {
+  return command("session_connect", { connectionId });
+}
+
+export function sessionTrustHost(
+  connectionId: string,
+  fingerprint: string,
+): Promise<void> {
+  return command("session_trust_host", { connectionId, fingerprint });
+}
+
+export function sessionDisconnect(sessionId: string): Promise<void> {
+  return command("session_disconnect", { sessionId });
+}
+
+export function sessionList(): Promise<LiveSession[]> {
+  return command("session_list");
+}

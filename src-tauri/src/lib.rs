@@ -2,6 +2,7 @@ mod connections;
 mod db;
 mod known_hosts;
 mod menu;
+mod session;
 mod vault;
 
 use tauri::Manager;
@@ -22,6 +23,7 @@ pub fn run() {
             }
             app.manage(vault::VaultState::system());
             app.manage(known_hosts::HostKeyState::new());
+            app.manage(session::SessionState::new());
             app.manage(database);
             Ok(())
         })
@@ -39,6 +41,10 @@ pub fn run() {
             known_hosts::hostkey_list,
             known_hosts::hostkey_forget,
             known_hosts::hostkey_confirm,
+            session::session_connect,
+            session::session_trust_host,
+            session::session_disconnect,
+            session::session_list,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())

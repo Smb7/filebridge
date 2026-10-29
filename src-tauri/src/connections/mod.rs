@@ -119,6 +119,20 @@ impl From<DbError> for CommandError {
     }
 }
 
+pub(crate) fn saved(
+    connection: &rusqlite::Connection,
+    id: &str,
+) -> Result<Option<Connection>, repo::RepoError> {
+    repo::get(connection, id)
+}
+
+pub(crate) fn touch_used(
+    connection: &rusqlite::Connection,
+    id: &str,
+) -> Result<(), repo::RepoError> {
+    repo::touch_used(connection, id)
+}
+
 #[tauri::command]
 pub fn connections_list(
     database: tauri::State<'_, Database>,

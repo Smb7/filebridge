@@ -3,9 +3,12 @@ import {
   blankToNull,
   hostKeyPromptCopy,
   isAppError,
+  isHostKeyStop,
   keyPathForMethod,
   planCredentialWrite,
   secretFromFields,
+  sessionForConnection,
+  type LiveSession,
 } from "./api";
 
 describe("isAppError", () => {
@@ -102,6 +105,30 @@ describe("planCredentialWrite", () => {
         hasSecret: true,
       }),
     ).toEqual({ action: "set" });
+  });
+});
+
+describe("live sessions", () => {
+  const live: LiveSession = {
+    sessionId: "ses-1",
+    connectionId: "conn-1",
+    name: "prod-telegraf",
+    username: "ubuntu",
+    host: "10.0.0.8",
+    port: 22,
+  };
+
+  it("finds the session for a saved connection and ignores the other pane", () => {
+    expect(sessionForConnection([live], "conn-1")).toEqual(live);
+    expect(sessionForConnection([live], "conn-2")).toBeUndefined();
+    expect(sessionForConnection([], "conn-1")).toBeUndefined();
+  });
+
+  it("treats only an untrusted or changed host key as a connect stop", () => {
+    expect(isHostKeyStop("host_key_unknown")).toBe(true);
+    expect(isHostKeyStop("host_key_changed")).toBe(true);
+    expect(isHostKeyStop("auth_failed")).toBe(false);
+    expect(isHostKeyStop("vault_locked")).toBe(false);
   });
 });
 

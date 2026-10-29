@@ -11,9 +11,15 @@
     hostkeyForget,
     hostkeyList,
     isAppError,
+    isHostKeyStop,
     keyPathForMethod,
     planCredentialWrite,
     secretFromFields,
+    sessionConnect,
+    sessionDisconnect,
+    sessionForConnection,
+    sessionList,
+    sessionTrustHost,
     vaultClearCredential,
     vaultHasCredential,
     vaultInitPassword,
@@ -23,6 +29,7 @@
     type AuthMethod,
     type Connection,
     type HostKeyPrompt,
+    type LiveSession,
     type TrustedHost,
     type VaultMode,
   } from "$lib/api";
@@ -57,6 +64,8 @@
   let busy = $state(false);
   let trustedHosts = $state<TrustedHost[]>([]);
   let hostPrompt = $state<HostKeyPrompt | null>(null);
+  let sessions = $state<LiveSession[]>([]);
+  let connectingId = $state<string | null>(null);
 
   function fill(connection: Connection) {
     selectedId = connection.id;
@@ -107,6 +116,7 @@
   async function refresh() {
     connections = await connectionsList();
     trustedHosts = await hostkeyList();
+    sessions = await sessionList();
   }
 
   function showError(error: unknown) {
@@ -149,8 +159,70 @@
     errorMessage = "";
     busy = true;
     try {
-      await hostkeyConfirm(hostPrompt.pendingId, replace);
+      if (connectingId) {
+        const connectionId = connectingId;
+        await sessionTrustHost(connectionId, hostPrompt.fingerprint);
+        hostPrompt = null;
+        await sessionConnect(connectionId);
+        connectingId = null;
+      } else {
+        await hostkeyConfirm(hostPrompt.pendingId, replace);
+        hostPrompt = null;
+      }
+      await refresh();
+    } catch (error) {
+      if (!isAppError(error) || !isHostKeyStop(error.code)) {
+        connectingId = null;
+        showError(error);
+      } else if (!hostPrompt) {
+        showError(error);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  function cancelHostKey() {
+    hostPrompt = null;
+    connectingId = null;
+  }
+
+  async function connectSelected() {
+    if (!selectedId) {
+      return;
+    }
+    errorMessage = "";
+    busy = true;
+    connectingId = selectedId;
+    try {
+      await sessionConnect(selectedId);
+      connectingId = null;
       hostPrompt = null;
+      await refresh();
+    } catch (error) {
+      if (!isAppError(error) || !isHostKeyStop(error.code)) {
+        connectingId = null;
+        showError(error);
+      } else if (!hostPrompt) {
+        showError(error);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function disconnectSelected() {
+    if (!selectedId) {
+      return;
+    }
+    const live = sessionForConnection(sessions, selectedId);
+    if (!live) {
+      return;
+    }
+    errorMessage = "";
+    busy = true;
+    try {
+      await sessionDisconnect(live.sessionId);
       await refresh();
     } catch (error) {
       showError(error);
@@ -327,9 +399,12 @@
               onclick={() => fill(connection)}
             >
               <span>{connection.name}</span>
-              <small
-                >{connection.username}@{connection.host}:{connection.port}</small
-              >
+              <small>
+                {connection.username}@{connection.host}:{connection.port}
+                {#if sessionForConnection(sessions, connection.id)}
+                  · Connected
+                {/if}
+              </small>
             </button>
           </li>
         {/each}
@@ -363,10 +438,8 @@
             >
               {hostKeyPromptCopy(hostPrompt.decision).confirm}
             </button>
-            <button
-              type="button"
-              disabled={busy}
-              onclick={() => (hostPrompt = null)}>Cancel</button
+            <button type="button" disabled={busy} onclick={cancelHostKey}
+              >Cancel</button
             >
           </div>
         </div>
@@ -545,6 +618,16 @@
 
       <div class="actions">
         <button type="submit" disabled={busy}>Save</button>
+        {#if selectedId}
+          <button type="button" disabled={busy} onclick={connectSelected}
+            >Connect</button
+          >
+        {/if}
+        {#if selectedId && sessionForConnection(sessions, selectedId)}
+          <button type="button" disabled={busy} onclick={disconnectSelected}
+            >Disconnect</button
+          >
+        {/if}
         {#if selectedId && hasCredential && !locked}
           <button type="button" disabled={busy} onclick={clearSecret}
             >Remove secret</button

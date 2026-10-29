@@ -84,7 +84,15 @@ pub fn delete(connection: &Sqlite, id: &str) -> Result<(), RepoError> {
     }
 }
 
-fn get(connection: &Sqlite, id: &str) -> Result<Option<Connection>, RepoError> {
+pub(crate) fn touch_used(connection: &Sqlite, id: &str) -> Result<(), RepoError> {
+    connection.execute(
+        "UPDATE connections SET last_used_at = datetime('now') WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn get(connection: &Sqlite, id: &str) -> Result<Option<Connection>, RepoError> {
     let mut statement = connection.prepare(
         "SELECT id, name, host, port, username, auth_method, key_path, default_path, notes,
                 created_at, updated_at, last_used_at
