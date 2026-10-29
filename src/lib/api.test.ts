@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   blankToNull,
+  hostKeyPromptCopy,
   isAppError,
   keyPathForMethod,
   secretFromFields,
@@ -46,5 +47,16 @@ describe("connection form helpers", () => {
     expect(secretFromFields("password", "hunter2", "ignored", "")).toEqual({
       password: "hunter2",
     });
+  });
+});
+
+describe("host key prompt", () => {
+  it("uses a louder replace action when the key changed", () => {
+    expect(hostKeyPromptCopy("unknown").confirm).toBe("Trust this key");
+    expect(hostKeyPromptCopy("changed").title).toBe("Host key changed");
+    expect(hostKeyPromptCopy("changed").confirm).toBe("Replace trusted key");
+    expect(hostKeyPromptCopy("changed").confirm).not.toBe(
+      hostKeyPromptCopy("unknown").confirm,
+    );
   });
 });

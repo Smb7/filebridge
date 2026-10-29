@@ -4,6 +4,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../../migrations/001_init.sql")),
     (2, include_str!("../../migrations/002_connections.sql")),
     (3, include_str!("../../migrations/003_credential_blobs.sql")),
+    (4, include_str!("../../migrations/004_known_hosts.sql")),
 ];
 
 #[derive(Debug)]

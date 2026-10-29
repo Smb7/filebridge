@@ -1,5 +1,6 @@
 mod connections;
 mod db;
+mod known_hosts;
 mod menu;
 mod vault;
 
@@ -20,6 +21,7 @@ pub fn run() {
                 .into());
             }
             app.manage(vault::VaultState::system());
+            app.manage(known_hosts::HostKeyState::new());
             app.manage(database);
             Ok(())
         })
@@ -33,6 +35,10 @@ pub fn run() {
             vault::vault_set_credential,
             vault::vault_clear_credential,
             vault::vault_has_credential,
+            known_hosts::hostkey_present,
+            known_hosts::hostkey_list,
+            known_hosts::hostkey_forget,
+            known_hosts::hostkey_confirm,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())
