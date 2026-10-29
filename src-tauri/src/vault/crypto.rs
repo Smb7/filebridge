@@ -32,6 +32,16 @@ pub fn test_kdf() -> KdfParams {
     }
 }
 
+/// Lowest parameters unlock will accept. Below this, a tampered database could
+/// make offline guessing cheap. Tests that only exercise AES use `test_kdf`.
+pub fn minimum_kdf() -> KdfParams {
+    KdfParams {
+        memory_kib: 19_456,
+        iterations: 2,
+        parallelism: 1,
+    }
+}
+
 #[derive(Debug)]
 pub struct CryptoError;
 

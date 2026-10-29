@@ -17,11 +17,14 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 base64 = "0.22"
 getrandom = "0.4"
-keyring = "3"
+# Platform features are required. keyring 3 has no default store; without these
+# it uses an in-memory mock, so a keychain DEK would vanish on the next launch.
+# Tests inject MemoryKeyStore and must not call OsKeyStore.
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
 serde_json = "1"
+sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 zeroize = { version = "1", features = ["alloc"] }
 # linux-libxdo makes the predefined Cut, Copy, Paste, and Select All items work on GTK.
