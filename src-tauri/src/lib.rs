@@ -10,10 +10,12 @@ pub fn run() {
             menu::install(app)?;
             let database = db::open(app.handle())?;
             let version = database.schema_version()?;
-            if version != "1" {
-                return Err(
-                    std::io::Error::other(format!("unexpected schema version {version}")).into(),
-                );
+            let expected = db::latest_schema_version();
+            if version != expected {
+                return Err(std::io::Error::other(format!(
+                    "unexpected schema version {version}, expected {expected}"
+                ))
+                .into());
             }
             app.manage(database);
             Ok(())

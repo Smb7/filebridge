@@ -11,6 +11,9 @@
   },
   "app": {
     "withGlobalTauri": false,
+    "appDirectoriesOverride": {
+      "data": "$DATA/filebridge"
+    },
     "windows": [
       {
         "title": "FileBridge",
