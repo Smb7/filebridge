@@ -334,3 +334,30 @@ export function fsRename(
 export function fsDelete(sessionId: string, path: string): Promise<void> {
   return command("fs_delete", { sessionId, path });
 }
+
+export type TransferStarted = {
+  transferId: string;
+};
+
+export type TransferProgress = {
+  id: string;
+  bytes: number;
+  total: number;
+  state: "running" | "done" | "cancelled" | "failed";
+  code?: string;
+  message?: string;
+};
+
+export function transferStart(input: {
+  fromSession: string;
+  fromPath: string;
+  toSession: string;
+  toPath: string;
+  overwrite: boolean;
+}): Promise<TransferStarted> {
+  return command("transfer_start", { ...input });
+}
+
+export function transferCancel(transferId: string): Promise<void> {
+  return command("transfer_cancel", { transferId });
+}

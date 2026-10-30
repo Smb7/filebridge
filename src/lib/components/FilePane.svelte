@@ -41,6 +41,21 @@
     type DirEntry,
   } from "$lib/browser";
   import { paneHeader, paneListPath } from "$lib/panes";
+  import {
+    TRANSFER_MIME,
+    acceptsDrop,
+    copyCandidate,
+    copyModifier,
+    dragData,
+    listOwnsShortcut,
+    markedMessage,
+    parseDropPayload,
+    planTransfer,
+    shortcutHint,
+    transferKeyAction,
+    type FileRef,
+    type StartRequest,
+  } from "$lib/transfer";
 
   type Props = {
     label: string;
@@ -59,6 +74,16 @@
     onConnect: () => void;
     onDisconnect: () => void;
     onSessionLost: () => void;
+    marked: FileRef | null;
+    onMark: (ref: FileRef) => void;
+    onStartTransfer: (request: StartRequest) => void;
+    transferLabel: string | null;
+    transferCanCancel: boolean;
+    onCancelTransfer: () => void;
+    reloadToken: number;
+    askOverwrite: string | null;
+    onOverwriteAnyway: () => void;
+    onDismissConflict: () => void;
   };
 
   let {
@@ -78,6 +103,16 @@
     onConnect,
     onDisconnect,
     onSessionLost,
+    marked,
+    onMark,
+    onStartTransfer,
+    transferLabel,
+    transferCanCancel,
+    onCancelTransfer,
+    reloadToken,
+    askOverwrite,
+    onOverwriteAnyway,
+    onDismissConflict,
   }: Props = $props();
 
   let browser = $state(createBrowser());
@@ -99,6 +134,27 @@
   } | null>(null);
   let acting = $state(false);
   let nameInput = $state<HTMLInputElement | null>(null);
+  let transferPrompt = $state<
+    | {
+        kind: "rename";
+        message: string;
+        suggested: string;
+        source: FileRef;
+      }
+    | {
+        kind: "overwrite";
+        message: string;
+        source: FileRef;
+        name: string;
+      }
+    | null
+  >(null);
+  let transferName = $state("");
+  let transferIn = $state<string | null>(null);
+  let seenReload = 0;
+  const copyKey = copyModifier(
+    typeof navigator === "undefined" ? "" : navigator.platform,
+  );
 
   const header = $derived(paneHeader(connection, focused));
   const statusId = $derived(`${label.toLowerCase().replace(/ /g, "-")}-status`);
@@ -113,6 +169,9 @@
   );
   const visible = $derived(browser.entries.slice(range.start, range.end));
   const status = $derived.by(() => {
+    if (transferLabel) {
+      return transferLabel;
+    }
     if (acting) {
       return "Working…";
     }
@@ -166,6 +225,141 @@
     nameDraft = "";
     namedIn = null;
     pendingDelete = null;
+    transferPrompt = null;
+    transferName = "";
+    transferIn = null;
+  }
+
+  function copySelected() {
+    const candidate = copyCandidate(
+      selectedEntry(),
+      session?.sessionId ?? null,
+    );
+    if (!candidate.ok) {
+      note = candidate.message;
+      return;
+    }
+    note = markedMessage(candidate.ref.name);
+    onMark(candidate.ref);
+  }
+
+  function beginTransfer(
+    source: FileRef | null,
+    renamedTo?: string,
+    overwriteConfirmed = false,
+  ) {
+    if (!session) {
+      note = "Connect the destination server.";
+      return;
+    }
+    const intent = planTransfer({
+      source,
+      toSession: session.sessionId,
+      directory: browser.path,
+      entries: browser.entries,
+      renamedTo,
+      overwriteConfirmed,
+    });
+    if (intent.action === "none") {
+      return;
+    }
+    if (intent.action === "refuse") {
+      note = intent.message;
+      transferPrompt = null;
+      return;
+    }
+    if (intent.action === "rename") {
+      transferPrompt = {
+        kind: "rename",
+        message: intent.message,
+        suggested: intent.suggested,
+        source: intent.from,
+      };
+      transferName = intent.suggested;
+      transferIn = browser.path;
+      pendingDelete = null;
+      namingMode = null;
+      void focusName();
+      return;
+    }
+    if (intent.action === "confirm-overwrite") {
+      transferPrompt = {
+        kind: "overwrite",
+        message: intent.message,
+        source: intent.from,
+        name: intent.name,
+      };
+      transferIn = browser.path;
+      pendingDelete = null;
+      namingMode = null;
+      return;
+    }
+    transferPrompt = null;
+    note = "";
+    onStartTransfer({
+      fromSession: intent.from.sessionId,
+      fromPath: intent.from.path,
+      toSession: intent.toSession,
+      toPath: intent.toPath,
+      overwrite: intent.overwrite,
+      name: intent.name,
+    });
+  }
+
+  function submitTransferName(event?: Event) {
+    event?.preventDefault();
+    if (transferPrompt?.kind !== "rename") {
+      return;
+    }
+    beginTransfer(transferPrompt.source, transferName, false);
+  }
+
+  function confirmOverwrite() {
+    if (transferPrompt?.kind !== "overwrite") {
+      return;
+    }
+    beginTransfer(transferPrompt.source, transferPrompt.name, true);
+  }
+
+  function onDragStart(event: DragEvent, item: DirEntry) {
+    if (!session || item.kind !== "file" || !event.dataTransfer) {
+      event.preventDefault();
+      return;
+    }
+    const candidate = copyCandidate(item, session.sessionId);
+    if (!candidate.ok) {
+      event.preventDefault();
+      return;
+    }
+    const data = dragData(candidate.ref);
+    event.dataTransfer.setData(data.mime, data.descriptor);
+    event.dataTransfer.setData("text/plain", data.text);
+    event.dataTransfer.effectAllowed = "copy";
+  }
+
+  function onDragOver(event: DragEvent) {
+    const types = event.dataTransfer ? [...event.dataTransfer.types] : [];
+    if (!session || !acceptsDrop(types)) {
+      return;
+    }
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  }
+
+  function onDrop(event: DragEvent) {
+    const types = event.dataTransfer ? [...event.dataTransfer.types] : [];
+    if (!session || !acceptsDrop(types)) {
+      return;
+    }
+    event.preventDefault();
+    const ref = parseDropPayload(event.dataTransfer?.getData(TRANSFER_MIME));
+    if (!ref) {
+      return;
+    }
+    onActivate();
+    beginTransfer(ref);
   }
 
   async function focusName() {
@@ -434,10 +628,33 @@
   }
 
   function onListKey(event: KeyboardEvent) {
-    if (namingMode || pendingDelete) {
+    if (namingMode || pendingDelete || transferPrompt) {
       if (event.key === "Escape") {
         event.preventDefault();
         cancelPrompt();
+      }
+      return;
+    }
+    const transfer = transferKeyAction(
+      event.key,
+      {
+        alt: event.altKey,
+        ctrl: event.ctrlKey,
+        meta: event.metaKey,
+        shift: event.shiftKey,
+      },
+      copyKey,
+    );
+    if (transfer !== "ignore" && listOwnsShortcut("div")) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!session) {
+        return;
+      }
+      if (transfer === "copy") {
+        copySelected();
+      } else {
+        beginTransfer(marked);
       }
       return;
     }
@@ -514,6 +731,7 @@
     seenSession = id;
     namingMode = null;
     pendingDelete = null;
+    transferPrompt = null;
     if (!id) {
       if (previous !== null) {
         browser = releaseSession(browser, start);
@@ -533,6 +751,18 @@
     if (namingMode && namedIn !== listed) {
       namingMode = null;
     }
+    if (transferPrompt && transferIn !== listed) {
+      transferPrompt = null;
+    }
+  });
+
+  $effect(() => {
+    const token = reloadToken;
+    if (token === 0 || token === seenReload || !session) {
+      return;
+    }
+    seenReload = token;
+    void load(session.sessionId, browser.path);
   });
 
   $effect(() => {
@@ -569,6 +799,8 @@
   bind:this={paneRoot}
   onpointerdown={() => onActivate()}
   onfocusin={() => onActivate()}
+  ondragover={onDragOver}
+  ondrop={onDrop}
 >
   <header>
     <div class="identity">
@@ -679,6 +911,40 @@
     </form>
   {/if}
 
+  {#if transferPrompt?.kind === "rename"}
+    <form class="prompt" onsubmit={submitTransferName}>
+      <label>
+        New name
+        <input
+          bind:this={nameInput}
+          bind:value={transferName}
+          spellcheck="false"
+          autocomplete="off"
+          autocapitalize="off"
+          onkeydown={onNameKey}
+        />
+      </label>
+      <button type="submit">Copy</button>
+      <button type="button" onclick={cancelPrompt}>Cancel</button>
+    </form>
+  {/if}
+
+  {#if transferPrompt?.kind === "overwrite"}
+    <div class="confirm" role="group" aria-label="Confirm replace">
+      <p>{transferPrompt.message}</p>
+      <button type="button" onclick={confirmOverwrite}>Replace</button>
+      <button type="button" onclick={cancelPrompt}>Cancel</button>
+    </div>
+  {/if}
+
+  {#if askOverwrite}
+    <div class="confirm" role="group" aria-label="Confirm replace">
+      <p>{askOverwrite}</p>
+      <button type="button" onclick={onOverwriteAnyway}>Replace</button>
+      <button type="button" onclick={onDismissConflict}>Cancel</button>
+    </div>
+  {/if}
+
   {#if pendingDelete}
     <div class="confirm" role="group" aria-label="Confirm delete">
       <p>{pendingDelete.message}</p>
@@ -714,6 +980,8 @@
             aria-setsize={browser.entries.length}
             style:height="{ROW_HEIGHT}px"
             tabindex={-1}
+            draggable={item.kind === "file"}
+            ondragstart={(event) => onDragStart(event, item)}
             onclick={() => selectRow(item.name)}
             ondblclick={() => {
               selectRow(item.name);
@@ -730,8 +998,15 @@
     </div>
   </div>
   <p class="status" id={statusId}>
-    {status}
-    <span class="keys">Up/Down, Enter, Backspace, F5, Tab, F2, Delete</span>
+    <span>{status}</span>
+    {#if transferCanCancel}
+      <button type="button" class="cancel" onclick={onCancelTransfer}>
+        Cancel
+      </button>
+    {/if}
+    <span class="keys">
+      Up/Down, Enter, Backspace, F5, Tab, F2, Delete, {shortcutHint(copyKey)}
+    </span>
   </p>
 </section>
 
@@ -929,9 +1204,14 @@
 
   .status {
     display: flex;
+    align-items: center;
     justify-content: space-between;
     gap: 1rem;
     min-height: 1.2rem;
+  }
+
+  .cancel {
+    padding: 0.15rem 0.45rem;
   }
 
   .error {

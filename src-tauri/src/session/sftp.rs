@@ -56,6 +56,17 @@ impl SftpGate {
         let _guard = self.lock.lock().await;
         Ok(op(from, to).await)
     }
+
+    /// Serialize a call that already has an open handle. The path was checked
+    /// when that handle was opened.
+    pub async fn exclusive<R, F, Fut>(&self, op: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = R>,
+    {
+        let _guard = self.lock.lock().await;
+        op().await
+    }
 }
 
 impl Default for SftpGate {
