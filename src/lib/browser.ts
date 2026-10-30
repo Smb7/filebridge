@@ -36,9 +36,6 @@ const MAX_REMOTE_PATH = 4096;
 
 export const ROW_HEIGHT = 28;
 
-export const FILE_OPEN_LATER =
-  "Opening files in an editor is not available yet.";
-
 export function createBrowser(path = "/"): BrowserState {
   return {
     path,

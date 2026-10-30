@@ -361,3 +361,103 @@ export function transferStart(input: {
 export function transferCancel(transferId: string): Promise<void> {
   return command("transfer_cancel", { transferId });
 }
+
+export type TextFile = {
+  content: string;
+  sha256: string;
+  size: number;
+};
+
+export type WrittenFile = {
+  sha256: string;
+  size: number;
+};
+
+export type EditorOpened = {
+  editorId: string;
+  focused: boolean;
+};
+
+export type EditorView = {
+  editorId: string;
+  sessionId: string;
+  connectionId: string;
+  path: string;
+  name: string;
+  username: string;
+  host: string;
+  port: number;
+  title: string;
+  connected: boolean;
+  dirty: boolean;
+  draft: string | null;
+  baselineSha256: string | null;
+};
+
+export type SaveNoted = {
+  retargeted: boolean;
+  path: string;
+};
+
+export type QuitPrompt = {
+  count: number;
+  paths: string[];
+};
+
+export function fsReadText(sessionId: string, path: string): Promise<TextFile> {
+  return command("fs_read_text", { sessionId, path });
+}
+
+export function fsWrite(
+  sessionId: string,
+  path: string,
+  content: string,
+  options: { overwrite: boolean; expectedSha256?: string },
+): Promise<WrittenFile> {
+  return command("fs_write", { sessionId, path, content, options });
+}
+
+export function editorOpen(
+  sessionId: string,
+  path: string,
+): Promise<EditorOpened> {
+  return command("editor_open", { sessionId, path });
+}
+
+export function editorState(includeDraft: boolean): Promise<EditorView> {
+  return command("editor_state", { includeDraft });
+}
+
+export function editorDraft(
+  content: string | null,
+  dirty: boolean,
+): Promise<void> {
+  return command("editor_draft", { content, dirty });
+}
+
+export function editorNoteSaved(
+  sha256: string,
+  path: string,
+): Promise<SaveNoted> {
+  return command("editor_note_saved", { sha256, path });
+}
+
+export function editorAllowClose(): Promise<boolean> {
+  return command("editor_allow_close");
+}
+
+export function editorDiscard(): Promise<void> {
+  return command("editor_discard");
+}
+
+export function editorCancelClose(): Promise<void> {
+  return command("editor_cancel_close");
+}
+
+export function editorQuit(): Promise<void> {
+  return command("editor_quit");
+}
+
+export function editorCancelQuit(): Promise<void> {
+  return command("editor_cancel_quit");
+}

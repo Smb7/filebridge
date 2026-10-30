@@ -1,5 +1,6 @@
 mod connections;
 mod db;
+mod editor;
 mod fs;
 mod known_hosts;
 mod menu;
@@ -27,6 +28,7 @@ pub fn run() {
             app.manage(known_hosts::HostKeyState::new());
             app.manage(session::SessionState::new());
             app.manage(transfer::TransferState::new());
+            app.manage(editor::EditorState::new());
             app.manage(database);
             Ok(())
         })
@@ -53,10 +55,29 @@ pub fn run() {
             fs::fs_mkdir,
             fs::fs_rename,
             fs::fs_delete,
+            fs::text::fs_read_text,
+            fs::text::fs_write,
             transfer::transfer_start,
             transfer::transfer_cancel,
+            editor::editor_open,
+            editor::editor_state,
+            editor::editor_draft,
+            editor::editor_note_saved,
+            editor::editor_allow_close,
+            editor::editor_discard,
+            editor::editor_cancel_close,
+            editor::editor_quit,
+            editor::editor_cancel_quit,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
-        .run(tauri::generate_context!())
-        .expect("error while running FileBridge");
+        .build(tauri::generate_context!())
+        .expect("error while running FileBridge")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && editor::should_prevent_exit(app)
+            {
+                api.prevent_exit();
+                editor::prompt_quit(app);
+            }
+        });
 }

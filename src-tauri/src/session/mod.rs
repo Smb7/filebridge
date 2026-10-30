@@ -660,6 +660,34 @@ impl SessionRegistry {
         Ok(sessions)
     }
 
+    fn summary(&self, session_id: &str) -> Result<Option<SessionSummary>, SessionError> {
+        let data = self.data.lock().map_err(|_| SessionError::Database)?;
+        let Some(connection_id) = data.by_session.get(session_id) else {
+            return Ok(None);
+        };
+        let Some(live) = data.by_connection.get(connection_id) else {
+            return Ok(None);
+        };
+        if live.link.is_closed() || live.summary.session_id != session_id {
+            return Ok(None);
+        }
+        Ok(Some(live.summary.clone()))
+    }
+
+    fn summary_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<SessionSummary>, SessionError> {
+        let data = self.data.lock().map_err(|_| SessionError::Database)?;
+        let Some(live) = data.by_connection.get(connection_id) else {
+            return Ok(None);
+        };
+        if live.link.is_closed() {
+            return Ok(None);
+        }
+        Ok(Some(live.summary.clone()))
+    }
+
     fn reusable(&self, saved: &SavedConnection) -> Result<Option<SessionStarted>, SessionError> {
         let Some(existing) = self.live(&saved.id)? else {
             return Ok(None);
@@ -1013,6 +1041,21 @@ impl SessionState {
         to: &str,
     ) -> Result<(), LinkError> {
         self.registry.rename_file(session_id, from, to).await
+    }
+
+    pub(crate) fn summary(&self, session_id: &str) -> Result<Option<SessionSummary>, LinkError> {
+        self.registry
+            .summary(session_id)
+            .map_err(|_| LinkError::Failed)
+    }
+
+    pub(crate) fn summary_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<SessionSummary>, LinkError> {
+        self.registry
+            .summary_for_connection(connection_id)
+            .map_err(|_| LinkError::Failed)
     }
 
     pub async fn delete_connection(
