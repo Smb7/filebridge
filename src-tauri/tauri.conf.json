@@ -16,6 +16,7 @@
     },
     "windows": [
       {
+        "label": "main",
         "title": "FileBridge",
         "width": 1100,
         "height": 720,

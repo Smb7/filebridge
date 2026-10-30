@@ -1,10 +1,14 @@
 <script lang="ts">
-  import { listen } from "@tauri-apps/api/event";
+  import { emitTo, listen } from "@tauri-apps/api/event";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
+  import EditorWindow from "$lib/components/EditorWindow.svelte";
   import FilePane from "$lib/components/FilePane.svelte";
   import {
     bindHostPrompt,
     blankToNull,
+    editorCancelQuit,
+    editorQuit,
     connectionsDelete,
     connectionsList,
     connectionsSave,
@@ -36,10 +40,11 @@
     type HostKeyPrompt,
     type LiveSession,
     type TrustedHost,
+    type QuitPrompt,
     type TransferProgress,
     type VaultMode,
   } from "$lib/api";
-  import { startingPath } from "$lib/browser";
+  import { serverLabel, startingPath } from "$lib/browser";
   import {
     PANE_SIDES,
     assignConnection,
@@ -110,6 +115,9 @@
     request: StartRequest;
   } | null>(null);
   let pendingTransfers = $state<TransferProgress[]>([]);
+  let windowRole = $state<"pending" | "main" | "editor">("pending");
+  let quitPrompt = $state<QuitPrompt | null>(null);
+  const editorOrigins = new Map<string, PaneSide>();
 
   const paste = $derived(
     pasteTarget({
@@ -162,7 +170,33 @@
     const next = setDirectory(panes, side, path);
     if (next !== panes) {
       panes = next;
+      publishPeers();
     }
+  }
+
+  function peerFor(side: PaneSide) {
+    const other = otherSide(side);
+    const connection = connectionFor(panes[other].connectionId);
+    const session = sessionFor(panes[other].connectionId);
+    return {
+      sessionId: session?.sessionId ?? null,
+      directory: panes[other].directory,
+      name: connection?.name ?? null,
+      endpoint: connection ? serverLabel(connection) : null,
+    };
+  }
+
+  function publishPeers() {
+    for (const [editorId, side] of editorOrigins) {
+      void emitTo(editorId, "editor://peer", peerFor(side)).catch(() => {
+        editorOrigins.delete(editorId);
+      });
+    }
+  }
+
+  function rememberEditor(side: PaneSide, editorId: string) {
+    editorOrigins.set(editorId, side);
+    void emitTo(editorId, "editor://peer", peerFor(side)).catch(() => {});
   }
 
   function choosePane(side: PaneSide, id: string) {
@@ -176,6 +210,7 @@
       connection.id,
       startingPath(connection.defaultPath),
     );
+    publishPeers();
     fill(connection);
   }
 
@@ -249,6 +284,7 @@
     ) {
       resetForm();
     }
+    publishPeers();
   }
 
   function showError(error: unknown) {
@@ -378,6 +414,17 @@
   }
 
   onMount(() => {
+    let label = "main";
+    try {
+      label = getCurrentWindow().label;
+    } catch {
+      label = "main";
+    }
+    if (label.startsWith("editor-")) {
+      windowRole = "editor";
+      return;
+    }
+    windowRole = "main";
     const unlisten = listen<HostKeyPrompt>("hostkey://prompt", (event) => {
       const bound = bindHostPrompt(connectingId, event.payload);
       if (bound) {
@@ -390,12 +437,30 @@
         applyTransfer(event.payload);
       },
     );
+    const unlistenQuit = listen<QuitPrompt>(
+      "editor://confirm-quit",
+      (event) => {
+        quitPrompt = event.payload;
+      },
+    );
+    const unlistenPeer = listen<{ editorId?: string }>(
+      "editor://request-peer",
+      (event) => {
+        const id = event.payload?.editorId;
+        const side = id ? editorOrigins.get(id) : undefined;
+        if (id && side) {
+          void emitTo(id, "editor://peer", peerFor(side)).catch(() => {});
+        }
+      },
+    );
     refresh()
       .then(() => refreshVault())
       .catch(showError);
     return () => {
       void unlisten.then((stop) => stop());
       void unlistenTransfer.then((stop) => stop());
+      void unlistenQuit.then((stop) => stop());
+      void unlistenPeer.then((stop) => stop());
     };
   });
 
@@ -639,355 +704,395 @@
   }
 </script>
 
-<main>
-  <section class="list" aria-label="Saved connections">
-    <header>
-      <h1>FileBridge</h1>
-      <button type="button" onclick={resetForm}>New</button>
-    </header>
-    {#if connections.length === 0}
-      <p class="empty">No saved connections.</p>
-    {:else}
-      <ul>
-        {#each connections as connection (connection.id)}
-          <li>
+{#if windowRole === "editor"}
+  <EditorWindow />
+{:else if windowRole === "main"}
+  <main>
+    <section class="list" aria-label="Saved connections">
+      <header>
+        <h1>FileBridge</h1>
+        <button type="button" onclick={resetForm}>New</button>
+      </header>
+      {#if connections.length === 0}
+        <p class="empty">No saved connections.</p>
+      {:else}
+        <ul>
+          {#each connections as connection (connection.id)}
+            <li>
+              <button
+                type="button"
+                class:selected={connection.id === selectedId}
+                onclick={() => chooseFocused(connection)}
+              >
+                <span>{connection.name}</span>
+                <small>
+                  {connection.username}@{connection.host}:{connection.port}
+                  {#if sessionForConnection(sessions, connection.id)}
+                    · Connected
+                  {/if}
+                </small>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+
+    <div class="workspace">
+      {#if quitPrompt}
+        <div class="prompt" role="group" aria-label="Quit with unsaved edits">
+          <p>
+            Quit without saving
+            {quitPrompt.count === 1 ? "1 file" : `${quitPrompt.count} files`}?
+          </p>
+          <ul>
+            {#each quitPrompt.paths as item (item)}
+              <li class="fingerprint">{item}</li>
+            {/each}
+          </ul>
+          <div class="actions">
+            <button type="button" onclick={() => void editorQuit()}
+              >Quit without saving</button
+            >
             <button
               type="button"
-              class:selected={connection.id === selectedId}
-              onclick={() => chooseFocused(connection)}
+              onclick={() => {
+                quitPrompt = null;
+                void editorCancelQuit();
+              }}>Cancel</button
             >
-              <span>{connection.name}</span>
-              <small>
-                {connection.username}@{connection.host}:{connection.port}
-                {#if sessionForConnection(sessions, connection.id)}
-                  · Connected
-                {/if}
-              </small>
-            </button>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-  </section>
-
-  <div class="workspace">
-    {#if hostPrompt}
-      <div
-        class="prompt"
-        class:changed={hostPrompt.decision === "changed"}
-        role="alert"
-      >
-        <h2>{hostKeyPromptCopy(hostPrompt.decision).title}</h2>
-        <p>
-          {hostPrompt.host}:{hostPrompt.port} · {hostPrompt.keyType}
-        </p>
-        <p class="fingerprint">{hostPrompt.fingerprint}</p>
-        {#if hostPrompt.storedFingerprint}
-          <p class="hint">
-            Previously trusted: {hostPrompt.storedFingerprint}
-          </p>
-        {/if}
-        <div class="actions">
-          <button type="button" disabled={busy} onclick={confirmHostKey}>
-            {hostKeyPromptCopy(hostPrompt.decision).confirm}
-          </button>
-          <button type="button" disabled={busy} onclick={cancelHostKey}
-            >Cancel</button
-          >
+          </div>
         </div>
-      </div>
-    {/if}
-    {#if errorMessage}
-      <p class="error banner" role="alert">{errorMessage}</p>
-    {/if}
-    {#if locked}
-      <form class="vault" onsubmit={unlock}>
-        <h2>
-          {vaultMode === "uninitialized"
-            ? "Create a vault password"
-            : vaultMode === "keychain"
-              ? "Keychain unavailable"
-              : "Unlock vault"}
-        </h2>
-        <p class="hint">
-          {vaultMode === "keychain"
-            ? "The system keychain could not be opened. Saved secrets stay locked until it is available."
-            : "Saved passwords and keys stay encrypted on this computer."}
-        </p>
-        {#if vaultMode !== "keychain"}
-          <label>
-            Master password
-            <input
-              type="password"
-              bind:value={masterPassword}
-              autocomplete={vaultMode === "uninitialized"
-                ? "new-password"
-                : "current-password"}
-              required
-            />
-          </label>
-          {#if vaultMode === "uninitialized"}
+      {/if}
+      {#if hostPrompt}
+        <div
+          class="prompt"
+          class:changed={hostPrompt.decision === "changed"}
+          role="alert"
+        >
+          <h2>{hostKeyPromptCopy(hostPrompt.decision).title}</h2>
+          <p>
+            {hostPrompt.host}:{hostPrompt.port} · {hostPrompt.keyType}
+          </p>
+          <p class="fingerprint">{hostPrompt.fingerprint}</p>
+          {#if hostPrompt.storedFingerprint}
+            <p class="hint">
+              Previously trusted: {hostPrompt.storedFingerprint}
+            </p>
+          {/if}
+          <div class="actions">
+            <button type="button" disabled={busy} onclick={confirmHostKey}>
+              {hostKeyPromptCopy(hostPrompt.decision).confirm}
+            </button>
+            <button type="button" disabled={busy} onclick={cancelHostKey}
+              >Cancel</button
+            >
+          </div>
+        </div>
+      {/if}
+      {#if errorMessage}
+        <p class="error banner" role="alert">{errorMessage}</p>
+      {/if}
+      {#if locked}
+        <form class="vault" onsubmit={unlock}>
+          <h2>
+            {vaultMode === "uninitialized"
+              ? "Create a vault password"
+              : vaultMode === "keychain"
+                ? "Keychain unavailable"
+                : "Unlock vault"}
+          </h2>
+          <p class="hint">
+            {vaultMode === "keychain"
+              ? "The system keychain could not be opened. Saved secrets stay locked until it is available."
+              : "Saved passwords and keys stay encrypted on this computer."}
+          </p>
+          {#if vaultMode !== "keychain"}
             <label>
-              Confirm password
+              Master password
               <input
                 type="password"
-                bind:value={confirmPassword}
-                autocomplete="new-password"
+                bind:value={masterPassword}
+                autocomplete={vaultMode === "uninitialized"
+                  ? "new-password"
+                  : "current-password"}
                 required
               />
             </label>
+            {#if vaultMode === "uninitialized"}
+              <label>
+                Confirm password
+                <input
+                  type="password"
+                  bind:value={confirmPassword}
+                  autocomplete="new-password"
+                  required
+                />
+              </label>
+            {/if}
           {/if}
-        {/if}
-        <button type="submit" disabled={busy}>
-          {vaultMode === "uninitialized"
-            ? "Create vault"
-            : vaultMode === "keychain"
-              ? "Retry"
-              : "Unlock"}
-        </button>
-      </form>
-    {/if}
-    <div
-      class="panes"
-      data-focused={panes.focused}
-      data-paste-path={paste?.path ?? ""}
-      data-paste-session={paste?.sessionId ?? ""}
-    >
-      {#each PANE_SIDES as side (side)}
-        <div class="pane-slot">
-          <FilePane
-            label={paneLabel(side)}
-            focused={panes.focused === side}
-            focusToken={focusToken[side]}
-            {connections}
-            connection={connectionFor(panes[side].connectionId)}
-            directory={panes[side].directory}
-            session={sessionFor(panes[side].connectionId)}
-            connecting={connectingId !== null &&
-              connectingId === panes[side].connectionId}
-            connectDisabled={busy ||
-              connectingId !== null ||
-              hostPrompt !== null}
-            onActivate={() => activate(side)}
-            onFocusOther={() => focusOther(side)}
-            onDirectory={(path) => rememberDirectory(side, path)}
-            onSelect={(id) => choosePane(side, id)}
-            onConnect={() => {
-              const id = panes[side].connectionId;
-              if (id) {
-                void connectConnection(id);
-              }
-            }}
-            onDisconnect={() => {
-              const id = panes[side].connectionId;
-              if (id) {
-                void disconnectConnection(id);
-              }
-            }}
-            onSessionLost={() => {
-              void refresh().catch(showError);
-            }}
-            {marked}
-            onMark={(ref) => {
-              marked = ref;
-            }}
-            onStartTransfer={(request) => {
-              void startTransfer(side, request);
-            }}
-            transferLabel={transferStatusText(paneJob(side))?.text ?? null}
-            transferCanCancel={transferStatusText(paneJob(side))?.canCancel ??
-              false}
-            onCancelTransfer={() => {
-              const job = paneJob(side);
-              if (job) {
-                void cancelTransfer(job.id);
-              }
-            }}
-            reloadToken={reloadToken[side]}
-            askOverwrite={conflict?.side === side ? conflict.message : null}
-            onOverwriteAnyway={() => {
-              if (conflict?.side === side) {
-                void startTransfer(side, conflict.request);
-              }
-            }}
-            onDismissConflict={() => {
-              conflict = null;
-            }}
-          />
-        </div>
-      {/each}
-    </div>
-    <details class="settings" open>
-      <summary>Connection settings</summary>
-      <section class="hosts">
-        <h2>Trusted hosts</h2>
-        {#if trustedHosts.length === 0}
-          <p class="empty">No host keys trusted yet.</p>
-        {:else}
-          <ul>
-            {#each trustedHosts as host (host.id)}
-              <li>
-                <span>{host.host}:{host.port}</span>
-                <small>{host.fingerprint}</small>
-                <button
-                  type="button"
-                  disabled={busy}
-                  onclick={() => forgetHost(host.id)}>Forget</button
-                >
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      </section>
-
-      <form onsubmit={save}>
-        <h2>{selectedId ? "Edit connection" : "New connection"}</h2>
-        <p class="hint">
-          {#if hasCredential}
-            A secret is saved. Leave the fields blank to keep it, or type a
-            replacement.
-          {:else if locked}
-            Unlock the vault before saving a password or key.
-          {:else}
-            Passwords and private keys are encrypted in the local vault.
-          {/if}
-        </p>
-
-        <label>
-          Name
-          <input bind:value={name} autocomplete="off" required />
-        </label>
-        <label>
-          Host
-          <input
-            bind:value={host}
-            autocomplete="off"
-            spellcheck="false"
-            required
-          />
-        </label>
-        <label>
-          Port
-          <input bind:value={port} type="number" min="1" max="65535" required />
-        </label>
-        <label>
-          Username
-          <input
-            bind:value={username}
-            autocomplete="off"
-            spellcheck="false"
-            required
-          />
-        </label>
-        <label>
-          Authentication
-          <select bind:value={authMethod}>
-            {#each methods as method (method.value)}
-              <option value={method.value}>{method.label}</option>
-            {/each}
-          </select>
-        </label>
-        {#if authMethod === "key_file"}
-          <label>
-            Key file path
-            <input bind:value={keyPath} autocomplete="off" spellcheck="false" />
-          </label>
-        {/if}
-        {#if authMethod === "password"}
-          <label>
-            Password
-            <input
-              type="password"
-              bind:value={password}
-              autocomplete="new-password"
-              disabled={locked}
-              placeholder={hasCredential ? "Saved — type to replace" : ""}
-            />
-          </label>
-        {/if}
-        {#if authMethod === "private_key"}
-          <label>
-            Private key
-            <textarea
-              bind:value={privateKeyPem}
-              rows="6"
-              spellcheck="false"
-              disabled={locked}
-              placeholder={hasCredential
-                ? "Saved — paste a new key to replace"
-                : ""}
-            ></textarea>
-          </label>
-        {/if}
-        {#if authMethod === "private_key" || authMethod === "key_file"}
-          <label>
-            Key passphrase
-            <input
-              type="password"
-              bind:value={passphrase}
-              autocomplete="new-password"
-              disabled={locked}
-              placeholder={hasCredential ? "Saved — type to replace" : ""}
-            />
-          </label>
-        {/if}
-        <label>
-          Default remote path
-          <input
-            bind:value={defaultPath}
-            autocomplete="off"
-            spellcheck="false"
-          />
-        </label>
-        <label>
-          Notes
-          <textarea bind:value={notes} rows="4"></textarea>
-        </label>
-
-        <div class="actions">
-          <button type="submit" disabled={busy}>Save</button>
-          {#if selectedId}
-            <button
-              type="button"
-              disabled={busy || connectingId !== null || hostPrompt !== null}
-              onclick={() => {
-                if (selectedId) {
-                  void connectConnection(selectedId);
+          <button type="submit" disabled={busy}>
+            {vaultMode === "uninitialized"
+              ? "Create vault"
+              : vaultMode === "keychain"
+                ? "Retry"
+                : "Unlock"}
+          </button>
+        </form>
+      {/if}
+      <div
+        class="panes"
+        data-focused={panes.focused}
+        data-paste-path={paste?.path ?? ""}
+        data-paste-session={paste?.sessionId ?? ""}
+      >
+        {#each PANE_SIDES as side (side)}
+          <div class="pane-slot">
+            <FilePane
+              label={paneLabel(side)}
+              focused={panes.focused === side}
+              focusToken={focusToken[side]}
+              {connections}
+              connection={connectionFor(panes[side].connectionId)}
+              directory={panes[side].directory}
+              session={sessionFor(panes[side].connectionId)}
+              connecting={connectingId !== null &&
+                connectingId === panes[side].connectionId}
+              connectDisabled={busy ||
+                connectingId !== null ||
+                hostPrompt !== null}
+              onActivate={() => activate(side)}
+              onFocusOther={() => focusOther(side)}
+              onDirectory={(path) => rememberDirectory(side, path)}
+              onSelect={(id) => choosePane(side, id)}
+              onConnect={() => {
+                const id = panes[side].connectionId;
+                if (id) {
+                  void connectConnection(id);
                 }
               }}
-            >
-              {connectingId === selectedId ? "Connecting…" : "Connect"}
-            </button>
-          {/if}
-          {#if selectedId && sessionForConnection(sessions, selectedId)}
-            <button
-              type="button"
-              disabled={busy}
-              onclick={() => {
-                if (selectedId) {
-                  void disconnectConnection(selectedId);
+              onDisconnect={() => {
+                const id = panes[side].connectionId;
+                if (id) {
+                  void disconnectConnection(id);
                 }
-              }}>Disconnect</button
-            >
+              }}
+              onSessionLost={() => {
+                void refresh().catch(showError);
+              }}
+              {marked}
+              onMark={(ref) => {
+                marked = ref;
+              }}
+              onStartTransfer={(request) => {
+                void startTransfer(side, request);
+              }}
+              transferLabel={transferStatusText(paneJob(side))?.text ?? null}
+              transferCanCancel={transferStatusText(paneJob(side))?.canCancel ??
+                false}
+              onCancelTransfer={() => {
+                const job = paneJob(side);
+                if (job) {
+                  void cancelTransfer(job.id);
+                }
+              }}
+              reloadToken={reloadToken[side]}
+              askOverwrite={conflict?.side === side ? conflict.message : null}
+              onOverwriteAnyway={() => {
+                if (conflict?.side === side) {
+                  void startTransfer(side, conflict.request);
+                }
+              }}
+              onDismissConflict={() => {
+                conflict = null;
+              }}
+              onEditorOpened={(editorId) => rememberEditor(side, editorId)}
+            />
+          </div>
+        {/each}
+      </div>
+      <details class="settings" open>
+        <summary>Connection settings</summary>
+        <section class="hosts">
+          <h2>Trusted hosts</h2>
+          {#if trustedHosts.length === 0}
+            <p class="empty">No host keys trusted yet.</p>
+          {:else}
+            <ul>
+              {#each trustedHosts as host (host.id)}
+                <li>
+                  <span>{host.host}:{host.port}</span>
+                  <small>{host.fingerprint}</small>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onclick={() => forgetHost(host.id)}>Forget</button
+                  >
+                </li>
+              {/each}
+            </ul>
           {/if}
-          {#if selectedId && hasCredential && !locked}
-            <button type="button" disabled={busy} onclick={clearSecret}
-              >Remove secret</button
-            >
+        </section>
+
+        <form onsubmit={save}>
+          <h2>{selectedId ? "Edit connection" : "New connection"}</h2>
+          <p class="hint">
+            {#if hasCredential}
+              A secret is saved. Leave the fields blank to keep it, or type a
+              replacement.
+            {:else if locked}
+              Unlock the vault before saving a password or key.
+            {:else}
+              Passwords and private keys are encrypted in the local vault.
+            {/if}
+          </p>
+
+          <label>
+            Name
+            <input bind:value={name} autocomplete="off" required />
+          </label>
+          <label>
+            Host
+            <input
+              bind:value={host}
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </label>
+          <label>
+            Port
+            <input
+              bind:value={port}
+              type="number"
+              min="1"
+              max="65535"
+              required
+            />
+          </label>
+          <label>
+            Username
+            <input
+              bind:value={username}
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </label>
+          <label>
+            Authentication
+            <select bind:value={authMethod}>
+              {#each methods as method (method.value)}
+                <option value={method.value}>{method.label}</option>
+              {/each}
+            </select>
+          </label>
+          {#if authMethod === "key_file"}
+            <label>
+              Key file path
+              <input
+                bind:value={keyPath}
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </label>
           {/if}
-          {#if selectedId}
-            <button
-              type="button"
-              class="danger"
-              disabled={busy}
-              onclick={remove}>Delete</button
-            >
+          {#if authMethod === "password"}
+            <label>
+              Password
+              <input
+                type="password"
+                bind:value={password}
+                autocomplete="new-password"
+                disabled={locked}
+                placeholder={hasCredential ? "Saved — type to replace" : ""}
+              />
+            </label>
           {/if}
-        </div>
-      </form>
-    </details>
-  </div>
-</main>
+          {#if authMethod === "private_key"}
+            <label>
+              Private key
+              <textarea
+                bind:value={privateKeyPem}
+                rows="6"
+                spellcheck="false"
+                disabled={locked}
+                placeholder={hasCredential
+                  ? "Saved — paste a new key to replace"
+                  : ""}
+              ></textarea>
+            </label>
+          {/if}
+          {#if authMethod === "private_key" || authMethod === "key_file"}
+            <label>
+              Key passphrase
+              <input
+                type="password"
+                bind:value={passphrase}
+                autocomplete="new-password"
+                disabled={locked}
+                placeholder={hasCredential ? "Saved — type to replace" : ""}
+              />
+            </label>
+          {/if}
+          <label>
+            Default remote path
+            <input
+              bind:value={defaultPath}
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </label>
+          <label>
+            Notes
+            <textarea bind:value={notes} rows="4"></textarea>
+          </label>
+
+          <div class="actions">
+            <button type="submit" disabled={busy}>Save</button>
+            {#if selectedId}
+              <button
+                type="button"
+                disabled={busy || connectingId !== null || hostPrompt !== null}
+                onclick={() => {
+                  if (selectedId) {
+                    void connectConnection(selectedId);
+                  }
+                }}
+              >
+                {connectingId === selectedId ? "Connecting…" : "Connect"}
+              </button>
+            {/if}
+            {#if selectedId && sessionForConnection(sessions, selectedId)}
+              <button
+                type="button"
+                disabled={busy}
+                onclick={() => {
+                  if (selectedId) {
+                    void disconnectConnection(selectedId);
+                  }
+                }}>Disconnect</button
+              >
+            {/if}
+            {#if selectedId && hasCredential && !locked}
+              <button type="button" disabled={busy} onclick={clearSecret}
+                >Remove secret</button
+              >
+            {/if}
+            {#if selectedId}
+              <button
+                type="button"
+                class="danger"
+                disabled={busy}
+                onclick={remove}>Delete</button
+              >
+            {/if}
+          </div>
+        </form>
+      </details>
+    </div>
+  </main>
+{/if}
 
 <style>
   :root {

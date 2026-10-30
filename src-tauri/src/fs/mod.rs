@@ -1,4 +1,5 @@
 pub(crate) mod path;
+pub(crate) mod text;
 
 use serde::Serialize;
 
