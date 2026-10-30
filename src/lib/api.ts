@@ -1,4 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { DirEntry } from "./browser";
+
+export type { DirEntry, EntryKind } from "./browser";
 
 export type AppError = {
   code: string;
@@ -306,4 +309,12 @@ export function sessionDisconnect(sessionId: string): Promise<void> {
 
 export function sessionList(): Promise<LiveSession[]> {
   return command("session_list");
+}
+
+export function fsList(sessionId: string, path: string): Promise<DirEntry[]> {
+  return command("fs_list", { sessionId, path });
+}
+
+export function fsStat(sessionId: string, path: string): Promise<DirEntry> {
+  return command("fs_stat", { sessionId, path });
 }

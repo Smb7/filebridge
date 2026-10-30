@@ -4,10 +4,14 @@ use std::time::Duration;
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::{FileAttributes, StatusCode};
 use zeroize::Zeroizing;
 
 use super::sftp::SftpGate;
-use super::{DialError, DialTarget, Dialer, PreparedAuth, RemoteLink, matches_trusted_key};
+use super::{
+    DialError, DialTarget, Dialer, LinkError, PreparedAuth, RawFile, RawMeta, RemoteFs, RemoteLink,
+    matches_trusted_key,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -253,6 +257,103 @@ struct RusshLink {
     closed: std::sync::atomic::AtomicBool,
 }
 
+impl RusshLink {
+    async fn read_remote_dir(&self, path: &str) -> Result<Vec<RawFile>, LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let session = sftp.lock().await;
+                collect_dir(&session, &absolute).await
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn read_remote_stat(&self, path: &str) -> Result<RawMeta, LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let session = sftp.lock().await;
+                collect_stat(&session, &absolute).await
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+}
+
+impl RemoteFs for RusshLink {
+    fn list_dir<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<RawFile>, LinkError>> + Send + 'a>,
+    > {
+        Box::pin(self.read_remote_dir(path))
+    }
+
+    fn stat_path<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RawMeta, LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.read_remote_stat(path))
+    }
+}
+
+fn meta_from(metadata: &FileAttributes) -> RawMeta {
+    RawMeta {
+        is_dir: metadata.is_dir(),
+        is_file: metadata.is_regular(),
+        is_symlink: metadata.is_symlink(),
+        size: metadata.len(),
+        modified: metadata.mtime.map(i64::from),
+    }
+}
+
+async fn collect_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RawFile>, LinkError> {
+    let listing = sftp.read_dir(path).await.map_err(map_client_error)?;
+    let mut files = Vec::new();
+    for entry in listing {
+        let metadata = entry.metadata();
+        files.push(RawFile {
+            name: entry.file_name(),
+            meta: meta_from(&metadata),
+        });
+    }
+    Ok(files)
+}
+
+async fn collect_stat(sftp: &SftpSession, path: &str) -> Result<RawMeta, LinkError> {
+    let metadata = sftp.metadata(path).await.map_err(map_client_error)?;
+    Ok(meta_from(&metadata))
+}
+
+pub(crate) fn link_error_from_code(code: StatusCode) -> LinkError {
+    match code {
+        StatusCode::NoSuchFile => LinkError::NotFound,
+        StatusCode::PermissionDenied => LinkError::PermissionDenied,
+        StatusCode::NoConnection | StatusCode::ConnectionLost => LinkError::NotConnected,
+        _ => LinkError::Failed,
+    }
+}
+
+fn map_client_error(error: russh_sftp::client::error::Error) -> LinkError {
+    match error {
+        russh_sftp::client::error::Error::Status(status) => {
+            link_error_from_code(status.status_code)
+        }
+        _ => LinkError::Failed,
+    }
+}
+
 impl RemoteLink for RusshLink {
     fn is_closed(&self) -> bool {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -278,6 +379,23 @@ impl RemoteLink for RusshLink {
 #[cfg(test)]
 mod tests {
     use super::decode_identity;
+
+    #[test]
+    fn a_server_status_message_is_not_part_of_the_link_error() {
+        let error = russh_sftp::client::error::Error::Status(russh_sftp::protocol::Status {
+            id: 1,
+            status_code: russh_sftp::protocol::StatusCode::PermissionDenied,
+            error_message: "hunter2-secret".to_string(),
+            language_tag: String::new(),
+        });
+        let mapped = super::map_client_error(error);
+        assert!(matches!(mapped, super::LinkError::PermissionDenied));
+        assert!(!format!("{mapped:?}").contains("hunter2-secret"));
+        assert!(matches!(
+            super::link_error_from_code(russh_sftp::protocol::StatusCode::NoSuchFile),
+            super::LinkError::NotFound
+        ));
+    }
 
     #[test]
     fn garbage_key_material_is_an_auth_failure_without_echoing_it() {
