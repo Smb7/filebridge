@@ -15,7 +15,6 @@
     attachSession,
     beginListing,
     childPath,
-    clearBrowser,
     createBrowser,
     entryMeta,
     escapePath,
@@ -26,12 +25,12 @@
     pathFieldEnabled,
     pathPointer,
     rejectListing,
+    releaseSession,
     scrollForIndex,
-    startingPath,
     visibleRange,
     type DirEntry,
   } from "$lib/browser";
-  import { paneHeader } from "$lib/panes";
+  import { paneHeader, paneListPath } from "$lib/panes";
 
   type Props = {
     label: string;
@@ -42,6 +41,7 @@
     session: LiveSession | null;
     connecting: boolean;
     connectDisabled: boolean;
+    directory: string;
     onActivate: () => void;
     onFocusOther: () => void;
     onDirectory: (path: string) => void;
@@ -60,6 +60,7 @@
     session,
     connecting,
     connectDisabled,
+    directory,
     onActivate,
     onFocusOther,
     onDirectory,
@@ -80,6 +81,7 @@
   let appliedFocus = 0;
 
   const header = $derived(paneHeader(connection, focused));
+  const statusId = $derived(`${label.toLowerCase().replace(/ /g, "-")}-status`);
   const pathValue = $derived(browser.draft ?? browser.path);
   const range = $derived(
     visibleRange({
@@ -132,7 +134,11 @@
     const token = started.generation;
     try {
       const entries = await fsList(sessionId, nextPath);
-      browser = acceptListing(browser, token, nextPath, entries);
+      const listed = acceptListing(browser, token, nextPath, entries);
+      browser = listed;
+      if (listed.generation === token && listed.path === nextPath) {
+        onDirectory(nextPath);
+      }
     } catch (error) {
       browser = rejectListing(browser, token, messageOf(error));
       if (
@@ -288,24 +294,23 @@
 
   $effect(() => {
     const id = session?.sessionId ?? null;
-    const start = startingPath(connection?.defaultPath);
+    const start = paneListPath(directory, connection?.defaultPath);
     if (id === seenSession) {
+      if (!id && browser.draft === null && browser.path !== start) {
+        browser = { ...browser, path: start, pathError: null };
+      }
       return;
     }
     const previous = seenSession;
     seenSession = id;
     if (!id) {
       if (previous !== null) {
-        browser = clearBrowser(browser);
+        browser = releaseSession(browser, start);
       }
       return;
     }
     browser = attachSession(browser, start);
     void load(id, start);
-  });
-
-  $effect(() => {
-    onDirectory(browser.path);
   });
 
   $effect(() => {
@@ -352,6 +357,7 @@
       <label>
         Server
         <select
+          aria-label="{label} server"
           value={connection?.id ?? ""}
           onchange={(event) => {
             const value = (event.currentTarget as HTMLSelectElement).value;
@@ -411,8 +417,8 @@
   <div
     class="viewport"
     role="listbox"
-    aria-label="Remote files"
-    aria-describedby="list-keys"
+    aria-label="{label} files"
+    aria-describedby={statusId}
     tabindex={session ? 0 : -1}
     bind:this={viewport}
     onscroll={measure}
@@ -446,7 +452,7 @@
       </div>
     </div>
   </div>
-  <p class="status" id="list-keys">
+  <p class="status" id={statusId}>
     {status}
     <span class="keys">Up/Down, Enter, Backspace, F5, Tab</span>
   </p>
@@ -511,7 +517,10 @@
   }
 
   .identity p {
+    overflow: hidden;
     font-family: ui-monospace, Consolas, monospace;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .controls,

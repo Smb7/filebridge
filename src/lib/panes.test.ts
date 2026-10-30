@@ -16,6 +16,7 @@ import {
   otherSide,
   paneHeader,
   paneLabel,
+  paneListPath,
   pasteTarget,
   setDirectory,
 } from "./panes";
@@ -135,6 +136,13 @@ describe("dual pane", () => {
     expect(state.left.connectionId).toBe("conn-1");
     expect(state.right.connectionId).toBeNull();
     expect(dropMissingConnections(state, ["conn-1"])).toBe(state);
+  });
+
+  it("lists a pane's own directory instead of the connection default", () => {
+    expect(paneListPath("/var/log", "/etc")).toBe("/var/log");
+    expect(paneListPath("/etc", "/etc")).toBe("/etc");
+    expect(paneListPath("relative", "/etc/telegraf")).toBe("/etc/telegraf");
+    expect(paneListPath("", null)).toBe("/");
   });
 
   it("targets paste at the focused pane's current directory", () => {
