@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import {
+    editorOpen,
     fsDelete,
     fsList,
     fsMkdir,
@@ -18,7 +19,6 @@
     planRename,
   } from "$lib/fileOps";
   import {
-    FILE_OPEN_LATER,
     ROW_HEIGHT,
     acceptListing,
     applyPathCommit,
@@ -84,6 +84,7 @@
     askOverwrite: string | null;
     onOverwriteAnyway: () => void;
     onDismissConflict: () => void;
+    onEditorOpened: (editorId: string) => void;
   };
 
   let {
@@ -113,6 +114,7 @@
     askOverwrite,
     onOverwriteAnyway,
     onDismissConflict,
+    onEditorOpened,
   }: Props = $props();
 
   let browser = $state(createBrowser());
@@ -531,6 +533,20 @@
     }
   }
 
+  async function openFile(path: string) {
+    if (!session) {
+      return;
+    }
+    try {
+      const opened = await editorOpen(session.sessionId, path);
+      onEditorOpened(opened.editorId);
+      note = "";
+    } catch (error) {
+      note = messageOf(error);
+      lostSession(error);
+    }
+  }
+
   async function openEntry(entry: DirEntry) {
     if (!session) {
       return;
@@ -545,7 +561,7 @@
       return;
     }
     if (action === "file") {
-      note = FILE_OPEN_LATER;
+      await openFile(next);
       return;
     }
     const sessionId = session.sessionId;
@@ -557,8 +573,10 @@
       }
       if (stat.kind === "dir") {
         await load(sessionId, next);
+      } else if (stat.kind === "file") {
+        await openFile(next);
       } else {
-        note = FILE_OPEN_LATER;
+        note = "That path is not a file.";
       }
     } catch (error) {
       if (token !== browser.generation) {

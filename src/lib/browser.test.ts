@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  FILE_OPEN_LATER,
   acceptListing,
   applyPathCommit,
   attachSession,
@@ -237,7 +236,6 @@ describe("file list keyboard and window", () => {
     expect(openAction("dir")).toBe("list");
     expect(openAction("symlink")).toBe("stat");
     expect(openAction("file")).toBe("file");
-    expect(FILE_OPEN_LATER).not.toContain("sudo");
     expect(entryMeta(entries[0])).toBe("Folder");
     expect(formatSize(1536)).toBe("1.5 KB");
   });
