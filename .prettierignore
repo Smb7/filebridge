@@ -1,5 +1,6 @@
 AGENT.md
 LICENSE
+.cargo
 node_modules
 build
 .svelte-kit

@@ -202,6 +202,30 @@ impl HostKeyState {
             .remove(pending_id);
         Ok(saved)
     }
+
+    /// Trust only the key the user was shown. A changed key is replaced only
+    /// when the fingerprint matches that presented key.
+    pub(crate) fn confirm_fingerprint(
+        &self,
+        connection: &Connection,
+        pending_id: &str,
+        fingerprint: &str,
+    ) -> Result<HostKeySummary, HostKeyError> {
+        let (pending_fingerprint, replace) = {
+            let pending = self.pending.lock().map_err(|_| HostKeyError::Database)?;
+            let pending = pending.get(pending_id).ok_or(HostKeyError::NotFound)?;
+            (
+                pending.fingerprint.clone(),
+                pending.decision == HostKeyDecision::Changed,
+            )
+        };
+        if pending_fingerprint != fingerprint {
+            return Err(HostKeyError::Invalid(
+                "The fingerprint does not match the presented host key.",
+            ));
+        }
+        self.confirm_on(connection, pending_id, replace)
+    }
 }
 
 impl Default for HostKeyState {
@@ -213,6 +237,36 @@ impl Default for HostKeyState {
 pub fn fingerprint(public_key: &[u8]) -> String {
     let digest = Sha256::digest(public_key);
     format!("SHA256:{}", BASE64.encode(digest))
+}
+
+pub(crate) struct StoredHostKey {
+    pub key_type: String,
+    pub public_key: Vec<u8>,
+}
+
+pub(crate) fn decision_for(stored: Option<&[u8]>, presented: &[u8]) -> HostKeyDecision {
+    classify(stored, presented)
+}
+
+pub(crate) fn stored_keys(
+    connection: &Connection,
+    host: &str,
+    port: u16,
+) -> Result<Vec<StoredHostKey>, HostKeyError> {
+    let host = host.trim().to_ascii_lowercase();
+    let mut statement = connection
+        .prepare("SELECT key_type, public_key FROM known_hosts WHERE host = ?1 AND port = ?2")?;
+    let rows = statement.query_map(params![host, port], |row| {
+        Ok(StoredHostKey {
+            key_type: row.get(0)?,
+            public_key: row.get(1)?,
+        })
+    })?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(row?);
+    }
+    Ok(keys)
 }
 
 fn classify(stored: Option<&[u8]>, presented: &[u8]) -> HostKeyDecision {
@@ -432,7 +486,8 @@ pub fn hostkey_confirm(
 #[cfg(test)]
 mod tests {
     use super::{
-        HostKeyDecision, HostKeyState, classify, fingerprint, forget, list, replace_key, trust,
+        HostKeyDecision, HostKeyState, classify, fingerprint, forget, list, replace_key,
+        stored_keys, trust,
     };
     use crate::db::apply_migrations;
     use rusqlite::Connection;
@@ -520,5 +575,49 @@ mod tests {
 
         forget(&connection, &list(&connection).expect("list")[0].id).expect("forget");
         assert!(list(&connection).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn confirm_fingerprint_matches_the_presented_key_and_does_not_silently_replace() {
+        let connection = open_db();
+        let state = HostKeyState::new();
+        let unknown = state
+            .present(&connection, "example.com", 22, "ssh-ed25519", b"key-a")
+            .expect("present unknown");
+        let mismatch = state
+            .confirm_fingerprint(&connection, &unknown.pending_id, "SHA256:not-the-key")
+            .expect_err("mismatch");
+        assert!(matches!(mismatch, super::HostKeyError::Invalid(_)));
+        assert!(list(&connection).expect("still empty").is_empty());
+
+        state
+            .confirm_fingerprint(&connection, &unknown.pending_id, &unknown.fingerprint)
+            .expect("trust");
+        assert_eq!(list(&connection).expect("trusted").len(), 1);
+
+        let changed = state
+            .present(&connection, "example.com", 22, "ssh-ed25519", b"key-b")
+            .expect("present changed");
+        assert_eq!(changed.decision, HostKeyDecision::Changed);
+        let refused = state
+            .confirm_fingerprint(&connection, &changed.pending_id, &fingerprint(b"key-a"))
+            .expect_err("old fingerprint must not replace");
+        assert!(matches!(refused, super::HostKeyError::Invalid(_)));
+        assert_eq!(
+            list(&connection).expect("unchanged")[0].fingerprint,
+            fingerprint(b"key-a")
+        );
+
+        state
+            .confirm_fingerprint(&connection, &changed.pending_id, &changed.fingerprint)
+            .expect("explicit replace");
+        assert_eq!(
+            list(&connection).expect("replaced")[0].fingerprint,
+            fingerprint(b"key-b")
+        );
+        let keys = stored_keys(&connection, "Example.COM", 22).expect("stored");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_type, "ssh-ed25519");
+        assert_eq!(keys[0].public_key, b"key-b");
     }
 }

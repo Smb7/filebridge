@@ -1,0 +1,5 @@
+# russh's RSA feature depends on the RustCrypto `rsa` crate. That advisory has
+# no fixed release. FileBridge uses the key to sign an SSH challenge, not to
+# decrypt attacker-chosen ciphertext. Ed25519 does not use this crate.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

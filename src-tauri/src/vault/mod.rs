@@ -1,5 +1,5 @@
-mod crypto;
-mod keystore;
+pub(crate) mod crypto;
+pub(crate) mod keystore;
 
 use std::sync::Mutex;
 
@@ -75,7 +75,7 @@ pub struct CommandError {
 }
 
 #[derive(Debug)]
-enum VaultError {
+pub(crate) enum VaultError {
     Locked,
     PasswordRequired,
     InvalidPassword,
@@ -152,7 +152,7 @@ impl VaultState {
         Self::new(Box::new(OsKeyStore), production_kdf())
     }
 
-    fn new(keystore: Box<dyn KeyStore>, kdf: KdfParams) -> Self {
+    pub(crate) fn new(keystore: Box<dyn KeyStore>, kdf: KdfParams) -> Self {
         Self {
             keystore,
             dek: Mutex::new(None),
@@ -166,7 +166,11 @@ impl VaultState {
         Ok(VaultStatus { mode, locked })
     }
 
-    fn init_password_on(&self, connection: &Connection, password: &str) -> Result<(), VaultError> {
+    pub(crate) fn init_password_on(
+        &self,
+        connection: &Connection,
+        password: &str,
+    ) -> Result<(), VaultError> {
         if self.keystore.available() {
             return Err(VaultError::KeychainAvailable);
         }
@@ -260,7 +264,7 @@ impl VaultState {
         self.store_dek(dek)
     }
 
-    fn set_credential_on(
+    pub(crate) fn set_credential_on(
         &self,
         connection: &Connection,
         connection_id: &str,
@@ -312,6 +316,35 @@ impl VaultState {
             )
             .optional()?;
         Ok(found.is_some())
+    }
+
+    pub(crate) fn is_locked(&self) -> Result<bool, VaultError> {
+        Ok(self.dek.lock().map_err(|_| VaultError::Database)?.is_none())
+    }
+
+    pub(crate) fn has_secret(
+        &self,
+        connection: &Connection,
+        connection_id: &str,
+    ) -> Result<bool, VaultError> {
+        self.has_credential_on(connection, connection_id)
+    }
+
+    pub(crate) fn load_secret(
+        &self,
+        connection: &Connection,
+        connection_id: &str,
+    ) -> Result<Option<CredentialSecret>, VaultError> {
+        let dek = self.current_dek()?;
+        let _ = auth_method(connection, connection_id)?;
+        let Some(mut payload) = read_payload(connection, connection_id, &dek)? else {
+            return Ok(None);
+        };
+        Ok(Some(CredentialSecret {
+            password: payload.password.take(),
+            private_key_pem: payload.private_key_pem.take(),
+            passphrase: payload.passphrase.take(),
+        }))
     }
 
     fn current_dek(&self) -> Result<Zeroizing<Vec<u8>>, VaultError> {

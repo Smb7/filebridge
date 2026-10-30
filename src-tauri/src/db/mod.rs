@@ -57,6 +57,13 @@ pub fn latest_schema_version() -> String {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) fn from_connection(connection: Connection) -> Self {
+        Self {
+            connection: Mutex::new(connection),
+        }
+    }
+
     pub fn with_connection<T, E>(
         &self,
         operation: impl FnOnce(&Connection) -> Result<T, E>,

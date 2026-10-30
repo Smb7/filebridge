@@ -2,10 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   blankToNull,
   hostKeyPromptCopy,
+  bindHostPrompt,
   isAppError,
+  isHostKeyStop,
+  promptFromConnectError,
   keyPathForMethod,
   planCredentialWrite,
   secretFromFields,
+  sessionForConnection,
+  type LiveSession,
 } from "./api";
 
 describe("isAppError", () => {
@@ -102,6 +107,67 @@ describe("planCredentialWrite", () => {
         hasSecret: true,
       }),
     ).toEqual({ action: "set" });
+  });
+});
+
+describe("live sessions", () => {
+  const live: LiveSession = {
+    sessionId: "ses-1",
+    connectionId: "conn-1",
+    name: "prod-telegraf",
+    username: "ubuntu",
+    host: "10.0.0.8",
+    port: 22,
+  };
+
+  it("finds the session for a saved connection and ignores the other pane", () => {
+    expect(sessionForConnection([live], "conn-1")).toEqual(live);
+    expect(sessionForConnection([live], "conn-2")).toBeUndefined();
+    expect(sessionForConnection([], "conn-1")).toBeUndefined();
+  });
+
+  it("treats only an untrusted or changed host key as a connect stop", () => {
+    expect(isHostKeyStop("host_key_unknown")).toBe(true);
+    expect(isHostKeyStop("host_key_changed")).toBe(true);
+    expect(isHostKeyStop("auth_failed")).toBe(false);
+    expect(isHostKeyStop("vault_locked")).toBe(false);
+  });
+
+  it("binds a host-key prompt to the connection that was connecting", () => {
+    const prompt = {
+      pendingId: "pending-1",
+      host: "10.0.0.8",
+      port: 22,
+      keyType: "ssh-ed25519",
+      fingerprint: "SHA256:abc",
+      storedFingerprint: "SHA256:old",
+      decision: "changed" as const,
+    };
+    expect(bindHostPrompt("conn-1", prompt)).toEqual({
+      ...prompt,
+      connectionId: "conn-1",
+    });
+    expect(bindHostPrompt(null, prompt)).toBeNull();
+    expect(bindHostPrompt("conn-1", undefined)).toBeNull();
+    expect(
+      promptFromConnectError("conn-1", {
+        code: "host_key_changed",
+        message: "The host key changed. Trust was not replaced. SHA256:abc",
+        prompt,
+      }),
+    ).toEqual({ ...prompt, connectionId: "conn-1" });
+    expect(
+      promptFromConnectError("conn-1", {
+        code: "auth_failed",
+        message: "Authentication failed.",
+      }),
+    ).toBeNull();
+    expect(
+      promptFromConnectError("conn-2", {
+        code: "host_key_unknown",
+        message: "This host key has not been trusted yet.",
+      }),
+    ).toBeNull();
   });
 });
 

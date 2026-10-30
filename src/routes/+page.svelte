@@ -2,18 +2,25 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import {
+    bindHostPrompt,
     blankToNull,
     connectionsDelete,
     connectionsList,
     connectionsSave,
     hostKeyPromptCopy,
-    hostkeyConfirm,
     hostkeyForget,
     hostkeyList,
     isAppError,
+    isHostKeyStop,
     keyPathForMethod,
     planCredentialWrite,
+    promptFromConnectError,
     secretFromFields,
+    sessionConnect,
+    sessionDisconnect,
+    sessionForConnection,
+    sessionList,
+    sessionTrustHost,
     vaultClearCredential,
     vaultHasCredential,
     vaultInitPassword,
@@ -21,8 +28,10 @@
     vaultStatus,
     vaultUnlock,
     type AuthMethod,
+    type BoundHostPrompt,
     type Connection,
     type HostKeyPrompt,
+    type LiveSession,
     type TrustedHost,
     type VaultMode,
   } from "$lib/api";
@@ -56,7 +65,9 @@
   let errorMessage = $state("");
   let busy = $state(false);
   let trustedHosts = $state<TrustedHost[]>([]);
-  let hostPrompt = $state<HostKeyPrompt | null>(null);
+  let hostPrompt = $state<BoundHostPrompt | null>(null);
+  let sessions = $state<LiveSession[]>([]);
+  let connectingId = $state<string | null>(null);
 
   function fill(connection: Connection) {
     selectedId = connection.id;
@@ -107,6 +118,7 @@
   async function refresh() {
     connections = await connectionsList();
     trustedHosts = await hostkeyList();
+    sessions = await sessionList();
   }
 
   function showError(error: unknown) {
@@ -132,7 +144,10 @@
 
   onMount(() => {
     const unlisten = listen<HostKeyPrompt>("hostkey://prompt", (event) => {
-      hostPrompt = event.payload;
+      const bound = bindHostPrompt(connectingId, event.payload);
+      if (bound) {
+        hostPrompt = bound;
+      }
     });
     refresh()
       .then(() => refreshVault())
@@ -142,15 +157,81 @@
     };
   });
 
-  async function confirmHostKey(replace: boolean) {
+  async function confirmHostKey() {
     if (!hostPrompt) {
+      return;
+    }
+    const prompt = hostPrompt;
+    errorMessage = "";
+    busy = true;
+    try {
+      await sessionTrustHost(prompt.connectionId, prompt.fingerprint);
+      hostPrompt = null;
+      await sessionConnect(prompt.connectionId);
+      if (connectingId === prompt.connectionId) {
+        connectingId = null;
+      }
+      await refresh();
+    } catch (error) {
+      const next = promptFromConnectError(prompt.connectionId, error);
+      if (next) {
+        hostPrompt = next;
+        connectingId = prompt.connectionId;
+      } else if (!isAppError(error) || !isHostKeyStop(error.code)) {
+        connectingId = null;
+        showError(error);
+      } else if (!hostPrompt) {
+        showError(error);
+      }
+    } finally {
+      busy = false;
+    }
+  }
+
+  function cancelHostKey() {
+    hostPrompt = null;
+    connectingId = null;
+  }
+
+  async function connectSelected() {
+    if (!selectedId || connectingId || hostPrompt) {
+      return;
+    }
+    const connectionId = selectedId;
+    errorMessage = "";
+    connectingId = connectionId;
+    try {
+      await sessionConnect(connectionId);
+      if (connectingId === connectionId) {
+        connectingId = null;
+      }
+      hostPrompt = null;
+      await refresh();
+    } catch (error) {
+      const prompt = promptFromConnectError(connectionId, error);
+      if (prompt) {
+        hostPrompt = prompt;
+        return;
+      }
+      if (connectingId === connectionId) {
+        connectingId = null;
+      }
+      showError(error);
+    }
+  }
+
+  async function disconnectSelected() {
+    if (!selectedId) {
+      return;
+    }
+    const live = sessionForConnection(sessions, selectedId);
+    if (!live) {
       return;
     }
     errorMessage = "";
     busy = true;
     try {
-      await hostkeyConfirm(hostPrompt.pendingId, replace);
-      hostPrompt = null;
+      await sessionDisconnect(live.sessionId);
       await refresh();
     } catch (error) {
       showError(error);
@@ -327,9 +408,12 @@
               onclick={() => fill(connection)}
             >
               <span>{connection.name}</span>
-              <small
-                >{connection.username}@{connection.host}:{connection.port}</small
-              >
+              <small>
+                {connection.username}@{connection.host}:{connection.port}
+                {#if sessionForConnection(sessions, connection.id)}
+                  · Connected
+                {/if}
+              </small>
             </button>
           </li>
         {/each}
@@ -356,17 +440,11 @@
             </p>
           {/if}
           <div class="actions">
-            <button
-              type="button"
-              disabled={busy}
-              onclick={() => confirmHostKey(hostPrompt?.decision === "changed")}
-            >
+            <button type="button" disabled={busy} onclick={confirmHostKey}>
               {hostKeyPromptCopy(hostPrompt.decision).confirm}
             </button>
-            <button
-              type="button"
-              disabled={busy}
-              onclick={() => (hostPrompt = null)}>Cancel</button
+            <button type="button" disabled={busy} onclick={cancelHostKey}
+              >Cancel</button
             >
           </div>
         </div>
@@ -545,6 +623,20 @@
 
       <div class="actions">
         <button type="submit" disabled={busy}>Save</button>
+        {#if selectedId}
+          <button
+            type="button"
+            disabled={busy || connectingId !== null || hostPrompt !== null}
+            onclick={connectSelected}
+          >
+            {connectingId === selectedId ? "Connecting…" : "Connect"}
+          </button>
+        {/if}
+        {#if selectedId && sessionForConnection(sessions, selectedId)}
+          <button type="button" disabled={busy} onclick={disconnectSelected}
+            >Disconnect</button
+          >
+        {/if}
         {#if selectedId && hasCredential && !locked}
           <button type="button" disabled={busy} onclick={clearSecret}
             >Remove secret</button
