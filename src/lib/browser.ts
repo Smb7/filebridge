@@ -28,6 +28,8 @@ export type ListAction =
   | { type: "parent" }
   | { type: "refresh" }
   | { type: "focus-other" }
+  | { type: "rename" }
+  | { type: "delete" }
   | { type: "ignore" };
 
 const MAX_REMOTE_PATH = 4096;
@@ -283,6 +285,10 @@ export function listKeyAction(
       return { type: "parent" };
     case "F5":
       return { type: "refresh" };
+    case "F2":
+      return modifiers.shift ? { type: "ignore" } : { type: "rename" };
+    case "Delete":
+      return modifiers.shift ? { type: "ignore" } : { type: "delete" };
     case "Tab":
       return modifiers.shift ? { type: "ignore" } : { type: "focus-other" };
     default:

@@ -1,4 +1,5 @@
 mod dial;
+mod ops;
 mod sftp;
 
 use std::collections::HashMap;
@@ -250,6 +251,9 @@ pub(crate) enum LinkError {
     NotConnected,
     NotFound,
     PermissionDenied,
+    NotEmpty,
+    AlreadyExists,
+    NotAllowed,
     Failed,
 }
 
@@ -280,6 +284,42 @@ pub(crate) trait RemoteFs: Send + Sync {
         &'a self,
         _path: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<RawMeta, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn lstat_path<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RawMeta, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn create_dir<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn rename_path<'a>(
+        &'a self,
+        _from: &'a str,
+        _to: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn remove_file<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn remove_dir<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
         Box::pin(async { Err(LinkError::Failed) })
     }
 }
@@ -434,6 +474,55 @@ impl SessionRegistry {
     async fn stat_path(&self, session_id: &str, path: &str) -> Result<RawMeta, LinkError> {
         let link = self.link_for(session_id, path)?;
         link.stat_path(path).await
+    }
+
+    async fn create_dir(&self, session_id: &str, path: &str) -> Result<(), LinkError> {
+        ops::plan_mkdir(path)?;
+        let link = self.link_for(session_id, path)?;
+        match link.lstat_path(path).await {
+            Ok(_) => Err(LinkError::AlreadyExists),
+            Err(LinkError::NotFound) => link.create_dir(path).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn rename_path(&self, session_id: &str, from: &str, to: &str) -> Result<(), LinkError> {
+        sftp::require_absolute_remote_path(to).map_err(|_| LinkError::InvalidPath)?;
+        match ops::plan_rename(from, to)? {
+            ops::RenamePlan::Unchanged => {
+                let _link = self.link_for(session_id, from)?;
+                Ok(())
+            }
+            ops::RenamePlan::Proceed => {
+                let link = self.link_for(session_id, from)?;
+                match link.lstat_path(to).await {
+                    Ok(_) => Err(LinkError::AlreadyExists),
+                    Err(LinkError::NotFound) => link.rename_path(from, to).await,
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    async fn remove_path(&self, session_id: &str, path: &str) -> Result<(), LinkError> {
+        if path == "/" {
+            return Err(LinkError::NotAllowed);
+        }
+        let link = self.link_for(session_id, path)?;
+        let meta = link.lstat_path(path).await?;
+        let names = if ops::is_real_directory(&meta) {
+            link.list_dir(path)
+                .await?
+                .into_iter()
+                .map(|file| file.name)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        match ops::plan_delete(path, &meta, &names)? {
+            ops::DeleteAction::RemoveFile => link.remove_file(path).await,
+            ops::DeleteAction::RemoveEmptyDir => link.remove_dir(path).await,
+        }
     }
 
     fn link_for(&self, session_id: &str, path: &str) -> Result<Arc<dyn RemoteLink>, LinkError> {
@@ -748,6 +837,23 @@ impl SessionState {
         path: &str,
     ) -> Result<RawMeta, LinkError> {
         self.registry.stat_path(session_id, path).await
+    }
+
+    pub(crate) async fn create_dir(&self, session_id: &str, path: &str) -> Result<(), LinkError> {
+        self.registry.create_dir(session_id, path).await
+    }
+
+    pub(crate) async fn rename_path(
+        &self,
+        session_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), LinkError> {
+        self.registry.rename_path(session_id, from, to).await
+    }
+
+    pub(crate) async fn remove_path(&self, session_id: &str, path: &str) -> Result<(), LinkError> {
+        self.registry.remove_path(session_id, path).await
     }
 
     pub async fn delete_connection(
@@ -1787,5 +1893,332 @@ mod tests {
             .expect_err("closed");
         assert!(matches!(closed, LinkError::NotConnected));
         assert_eq!(link.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct OpLink {
+        closed: AtomicBool,
+        nodes: Mutex<std::collections::HashMap<String, RawMeta>>,
+        children: Mutex<std::collections::HashMap<String, Vec<String>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl OpLink {
+        fn new() -> Self {
+            Self {
+                closed: AtomicBool::new(false),
+                nodes: Mutex::new(std::collections::HashMap::new()),
+                children: Mutex::new(std::collections::HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn note(&self, action: &str, path: &str) {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("{action} {path}"));
+        }
+
+        fn put(&self, path: &str, meta: RawMeta) {
+            self.nodes
+                .lock()
+                .expect("nodes")
+                .insert(path.to_string(), meta);
+        }
+    }
+
+    fn file_meta(is_dir: bool, is_symlink: bool) -> RawMeta {
+        RawMeta {
+            is_dir,
+            is_file: !is_dir && !is_symlink,
+            is_symlink,
+            size: 4,
+            modified: None,
+        }
+    }
+
+    impl RemoteFs for OpLink {
+        fn lstat_path<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<RawMeta, LinkError>> + Send + 'a>,
+        > {
+            self.note("lstat", path);
+            let result = self
+                .nodes
+                .lock()
+                .expect("nodes")
+                .get(path)
+                .cloned()
+                .ok_or(LinkError::NotFound);
+            Box::pin(async move { result })
+        }
+
+        fn list_dir<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<RawFile>, LinkError>> + Send + 'a>,
+        > {
+            self.note("list", path);
+            let names = self
+                .children
+                .lock()
+                .expect("children")
+                .get(path)
+                .cloned()
+                .unwrap_or_default();
+            Box::pin(async move {
+                Ok(names
+                    .into_iter()
+                    .map(|name| RawFile {
+                        name,
+                        meta: file_meta(false, false),
+                    })
+                    .collect())
+            })
+        }
+
+        fn create_dir<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+        {
+            self.note("create_dir", path);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rename_path<'a>(
+            &'a self,
+            from: &'a str,
+            to: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+        {
+            self.note("rename", from);
+            self.note("rename_to", to);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn remove_file<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+        {
+            self.note("remove_file", path);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn remove_dir<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+        {
+            self.note("remove_dir", path);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl RemoteLink for OpLink {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+
+        fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.closed.store(true, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    struct OpDialer {
+        link: Arc<OpLink>,
+    }
+
+    impl Dialer for OpDialer {
+        async fn dial(&self, _target: DialTarget) -> Result<Arc<dyn RemoteLink>, DialError> {
+            Ok(self.link.clone())
+        }
+    }
+
+    async fn connect_ops(link: Arc<OpLink>) -> (Fixture, String) {
+        let fixture = fixture("password", None);
+        save_password(&fixture, "hunter2-secret");
+        let started = fixture
+            .registry
+            .connect(
+                &OpDialer { link },
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("connect");
+        (fixture, started.session_id)
+    }
+
+    #[tokio::test]
+    async fn refused_paths_never_reach_the_link() {
+        let registry = SessionRegistry::new();
+        assert!(matches!(
+            registry
+                .remove_path("missing", "/")
+                .await
+                .expect_err("root"),
+            LinkError::NotAllowed
+        ));
+        assert!(matches!(
+            registry.create_dir("missing", "/").await.expect_err("root"),
+            LinkError::NotAllowed
+        ));
+        assert!(matches!(
+            registry
+                .rename_path("missing", "/etc", "/etc/conf.d")
+                .await
+                .expect_err("into self"),
+            LinkError::NotAllowed
+        ));
+        let nul = registry
+            .remove_path("missing", "/etc/\0telegraf")
+            .await
+            .expect_err("nul");
+        assert!(matches!(nul, LinkError::InvalidPath));
+        assert!(!format!("{nul:?}").contains("hunter2-secret"));
+        assert!(matches!(
+            registry
+                .rename_path("missing", "relative.conf", "/etc/other.conf")
+                .await
+                .expect_err("relative"),
+            LinkError::InvalidPath
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_does_not_recurse_or_turn_a_path_into_a_command() {
+        let link = Arc::new(OpLink::new());
+        let awkward = "/etc/telegraf/my file; rm -rf.conf";
+        link.put(awkward, file_meta(false, false));
+        link.put("/etc/telegraf/link", file_meta(true, true));
+        link.put("/etc/telegraf/conf.d", file_meta(true, false));
+        link.put("/etc/telegraf/empty", file_meta(true, false));
+        link.children.lock().expect("children").insert(
+            "/etc/telegraf/conf.d".to_string(),
+            vec![".".to_string(), "cpu.conf".to_string()],
+        );
+        link.children.lock().expect("children").insert(
+            "/etc/telegraf/empty".to_string(),
+            vec![".".to_string(), "..".to_string()],
+        );
+        let (fixture, session_id) = connect_ops(link.clone()).await;
+
+        fixture
+            .registry
+            .remove_path(&session_id, awkward)
+            .await
+            .expect("file");
+        fixture
+            .registry
+            .remove_path(&session_id, "/etc/telegraf/link")
+            .await
+            .expect("symlink");
+        let occupied = fixture
+            .registry
+            .remove_path(&session_id, "/etc/telegraf/conf.d")
+            .await
+            .expect_err("occupied");
+        assert!(matches!(occupied, LinkError::NotEmpty));
+        fixture
+            .registry
+            .remove_path(&session_id, "/etc/telegraf/empty")
+            .await
+            .expect("empty");
+
+        let calls = link.calls.lock().expect("calls").clone();
+        assert_eq!(
+            calls,
+            vec![
+                format!("lstat {awkward}"),
+                format!("remove_file {awkward}"),
+                "lstat /etc/telegraf/link".to_string(),
+                "remove_file /etc/telegraf/link".to_string(),
+                "lstat /etc/telegraf/conf.d".to_string(),
+                "list /etc/telegraf/conf.d".to_string(),
+                "lstat /etc/telegraf/empty".to_string(),
+                "list /etc/telegraf/empty".to_string(),
+                "remove_dir /etc/telegraf/empty".to_string(),
+            ]
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.contains("sudo") || call.contains("sh -c"))
+        );
+        assert!(!format!("{occupied:?}").contains("hunter2-secret"));
+    }
+
+    #[tokio::test]
+    async fn mkdir_and_rename_do_not_overwrite_or_shell_out() {
+        let link = Arc::new(OpLink::new());
+        link.put("/etc/telegraf/cpu.conf", file_meta(false, false));
+        let (fixture, session_id) = connect_ops(link.clone()).await;
+
+        let exists = fixture
+            .registry
+            .create_dir(&session_id, "/etc/telegraf/cpu.conf")
+            .await
+            .expect_err("exists");
+        assert!(matches!(exists, LinkError::AlreadyExists));
+
+        fixture
+            .registry
+            .create_dir(&session_id, "/etc/telegraf/conf.d")
+            .await
+            .expect("mkdir");
+
+        let same = fixture
+            .registry
+            .rename_path(
+                &session_id,
+                "/etc/telegraf/cpu.conf",
+                "/etc/telegraf/cpu.conf",
+            )
+            .await;
+        assert!(same.is_ok());
+
+        let taken = fixture
+            .registry
+            .rename_path(
+                &session_id,
+                "/etc/telegraf/mem.conf",
+                "/etc/telegraf/cpu.conf",
+            )
+            .await
+            .expect_err("taken");
+        assert!(matches!(taken, LinkError::AlreadyExists));
+
+        fixture
+            .registry
+            .rename_path(
+                &session_id,
+                "/etc/telegraf/mem.conf",
+                "/etc/telegraf/disk.conf",
+            )
+            .await
+            .expect("rename");
+
+        let calls = link.calls.lock().expect("calls").clone();
+        assert_eq!(
+            calls,
+            vec![
+                "lstat /etc/telegraf/cpu.conf".to_string(),
+                "lstat /etc/telegraf/conf.d".to_string(),
+                "create_dir /etc/telegraf/conf.d".to_string(),
+                "lstat /etc/telegraf/cpu.conf".to_string(),
+                "lstat /etc/telegraf/disk.conf".to_string(),
+                "rename /etc/telegraf/mem.conf".to_string(),
+                "rename_to /etc/telegraf/disk.conf".to_string(),
+            ]
+        );
+        assert!(!calls.iter().any(|call| call.contains("sudo")));
     }
 }

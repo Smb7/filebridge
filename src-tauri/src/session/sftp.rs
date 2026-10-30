@@ -45,6 +45,17 @@ impl SftpGate {
         let _guard = self.lock.lock().await;
         Ok(op(path).await)
     }
+
+    pub async fn run_two<R, F, Fut>(&self, from: &str, to: &str, op: F) -> Result<R, PathError>
+    where
+        F: FnOnce(String, String) -> Fut,
+        Fut: Future<Output = R>,
+    {
+        let from = require_absolute_remote_path(from)?;
+        let to = require_absolute_remote_path(to)?;
+        let _guard = self.lock.lock().await;
+        Ok(op(from, to).await)
+    }
 }
 
 impl Default for SftpGate {
@@ -107,5 +118,30 @@ mod tests {
             task.await.expect("task");
         }
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_second_path_does_not_run() {
+        let gate = SftpGate::new();
+        let ran = AtomicUsize::new(0);
+        let rejected = gate
+            .run_two("/etc/telegraf", "relative.conf", |_, _| async {
+                ran.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+        assert!(rejected.is_err());
+        let nul = gate
+            .run_two("/etc/\0telegraf", "/etc/other", |_, _| async {
+                ran.fetch_add(1, Ordering::SeqCst);
+            })
+            .await;
+        assert!(nul.is_err());
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        gate.run_two("/etc/from", "/etc/to", |from, to| async move {
+            assert_eq!(from, "/etc/from");
+            assert_eq!(to, "/etc/to");
+        })
+        .await
+        .expect("pair");
     }
 }
