@@ -1,6 +1,7 @@
 mod dial;
 pub(crate) mod ops;
 mod sftp;
+pub(crate) mod shell;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -364,6 +365,16 @@ pub(crate) trait RemoteFs: Send + Sync {
 trait RemoteLink: RemoteFs {
     fn is_closed(&self) -> bool;
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Open a login shell on this connection. The default refuses so tests
+    /// that never start a shell do not need a channel.
+    fn open_shell<'a>(
+        &'a self,
+        _cols: u32,
+        _rows: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<shell::OpenedShell, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
 }
 
 trait Dialer: Send + Sync {
@@ -1043,6 +1054,22 @@ impl SessionState {
         self.registry.rename_file(session_id, from, to).await
     }
 
+    pub(crate) async fn open_shell(
+        &self,
+        session_id: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Result<shell::OpenedShell, LinkError> {
+        let link = self.registry.link_of(session_id)?;
+        link.open_shell(cols, rows).await
+    }
+
+    pub(crate) fn session_id_for_connection(&self, connection_id: &str) -> Option<String> {
+        self.registry.list().ok()?.into_iter().find_map(|session| {
+            (session.connection_id == connection_id).then_some(session.session_id)
+        })
+    }
+
     pub(crate) fn summary(&self, session_id: &str) -> Result<Option<SessionSummary>, LinkError> {
         self.registry
             .summary(session_id)
@@ -1122,8 +1149,10 @@ pub async fn session_trust_host(
 #[tauri::command]
 pub async fn session_disconnect(
     sessions: tauri::State<'_, SessionState>,
+    terminals: tauri::State<'_, crate::term::TerminalState>,
     session_id: String,
 ) -> Result<(), CommandError> {
+    terminals.close_session(&session_id).await;
     sessions
         .registry
         .disconnect(&session_id)

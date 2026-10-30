@@ -166,10 +166,14 @@ pub fn connections_save(
 pub async fn connections_delete(
     database: tauri::State<'_, Database>,
     sessions: tauri::State<'_, crate::session::SessionState>,
+    terminals: tauri::State<'_, crate::term::TerminalState>,
     id: String,
 ) -> Result<(), CommandError> {
     // Close any live SSH session under the same lock that connect uses, then
     // delete the row. Otherwise a connect in flight can revive a deleted server.
+    if let Some(session_id) = sessions.session_id_for_connection(&id) {
+        terminals.close_session(&session_id).await;
+    }
     sessions.delete_connection(&database, &id).await
 }
 

@@ -5,6 +5,7 @@ mod fs;
 mod known_hosts;
 mod menu;
 mod session;
+mod term;
 mod transfer;
 mod vault;
 
@@ -27,6 +28,7 @@ pub fn run() {
             app.manage(vault::VaultState::system());
             app.manage(known_hosts::HostKeyState::new());
             app.manage(session::SessionState::new());
+            app.manage(term::TerminalState::new());
             app.manage(transfer::TransferState::new());
             app.manage(editor::EditorState::new());
             app.manage(database);
@@ -59,6 +61,10 @@ pub fn run() {
             fs::text::fs_write,
             transfer::transfer_start,
             transfer::transfer_cancel,
+            term::term_open,
+            term::term_write,
+            term::term_resize,
+            term::term_close,
             editor::editor_open,
             editor::editor_state,
             editor::editor_draft,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use russh::ChannelMsg;
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use russh_sftp::client::SftpSession;
@@ -11,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 use super::sftp::SftpGate;
+use super::shell;
 use super::{
     DialError, DialTarget, Dialer, LinkError, PreparedAuth, RawFile, RawMeta, RemoteFs, RemoteLink,
     matches_trusted_key,
@@ -19,6 +21,8 @@ use super::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const SFTP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const SHELL_START_TIMEOUT: Duration = Duration::from_secs(10);
+const SHELL_TERM: &str = "xterm-256color";
 const MAX_KEY_BYTES: u64 = 256 * 1024;
 
 enum Rejection {
@@ -455,6 +459,90 @@ impl RusshLink {
             .await
     }
 
+    /// Login shell on a second channel. SFTP keeps the first. Never `exec`.
+    async fn open_remote_shell(
+        &self,
+        cols: u32,
+        rows: u32,
+    ) -> Result<shell::OpenedShell, LinkError> {
+        if self.is_closed() {
+            return Err(LinkError::NotConnected);
+        }
+        let mut channel = {
+            let handle = self.handle.lock().await;
+            if handle.is_closed() {
+                return Err(LinkError::NotConnected);
+            }
+            handle
+                .channel_open_session()
+                .await
+                .map_err(|_| LinkError::Failed)?
+        };
+        if channel
+            .request_pty(false, SHELL_TERM, cols, rows, 0, 0, &[])
+            .await
+            .is_err()
+            || channel.request_shell(true).await.is_err()
+        {
+            let _ = channel.close().await;
+            return Err(LinkError::Failed);
+        }
+        let early =
+            match tokio::time::timeout(SHELL_START_TIMEOUT, wait_shell_ready(&mut channel)).await {
+                Ok(Ok(early)) => early,
+                Ok(Err(error)) => {
+                    let _ = channel.close().await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    let _ = channel.close().await;
+                    return Err(LinkError::Failed);
+                }
+            };
+        let (mut reader, writer) = channel.split();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        if !early.is_empty() {
+            let _ = tx.try_send(shell::ShellBytes::Data(early));
+        }
+        tokio::spawn(async move {
+            loop {
+                match reader.wait().await {
+                    Some(ChannelMsg::Data { data }) => {
+                        if tx
+                            .send(shell::ShellBytes::Data(data.to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, .. }) => {
+                        if tx
+                            .send(shell::ShellBytes::Data(data.to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                    Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::ExitSignal { .. }) => {
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            let _ = tx.send(shell::ShellBytes::Closed).await;
+        });
+        Ok(shell::OpenedShell {
+            writer: Arc::new(ChannelWriter {
+                write: tokio::sync::Mutex::new(writer),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }),
+            incoming: rx,
+        })
+    }
+
     async fn close_remote_open(&self, token: &str) -> Result<(), LinkError> {
         let opens = &self.opens;
         let token = token.to_string();
@@ -654,6 +742,76 @@ fn map_client_error(error: russh_sftp::client::error::Error) -> LinkError {
     }
 }
 
+struct ChannelWriter {
+    write: tokio::sync::Mutex<russh::ChannelWriteHalf<client::Msg>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl shell::ShellWriter for ChannelWriter {
+    fn write<'a>(
+        &'a self,
+        data: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(LinkError::NotConnected);
+            }
+            let write = self.write.lock().await;
+            write
+                .data_bytes(data.to_vec())
+                .await
+                .map_err(|_| LinkError::NotConnected)
+        })
+    }
+
+    fn resize<'a>(
+        &'a self,
+        cols: u32,
+        rows: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(LinkError::NotConnected);
+            }
+            let write = self.write.lock().await;
+            write
+                .window_change(cols, rows, 0, 0)
+                .await
+                .map_err(|_| LinkError::NotConnected)
+        })
+    }
+
+    fn close<'a>(&'a self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let write = self.write.lock().await;
+            let _ = write.eof().await;
+            let _ = write.close().await;
+        })
+    }
+}
+
+async fn wait_shell_ready(channel: &mut russh::Channel<client::Msg>) -> Result<Vec<u8>, LinkError> {
+    let mut early = Vec::new();
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Success) => return Ok(early),
+            Some(ChannelMsg::Failure) => return Err(LinkError::Failed),
+            Some(ChannelMsg::Data { data }) => early.extend_from_slice(&data),
+            Some(ChannelMsg::ExtendedData { data, .. }) => early.extend_from_slice(&data),
+            Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                return Err(LinkError::NotConnected);
+            }
+            Some(ChannelMsg::ExitStatus { .. }) | Some(ChannelMsg::ExitSignal { .. }) => {
+                return Err(LinkError::Failed);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
 impl RemoteLink for RusshLink {
     fn is_closed(&self) -> bool {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -673,6 +831,16 @@ impl RemoteLink for RusshLink {
                 .disconnect(russh::Disconnect::ByApplication, "", "")
                 .await;
         })
+    }
+
+    fn open_shell<'a>(
+        &'a self,
+        cols: u32,
+        rows: u32,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<shell::OpenedShell, LinkError>> + Send + 'a>,
+    > {
+        Box::pin(self.open_remote_shell(cols, rows))
     }
 }
 
