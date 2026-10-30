@@ -244,7 +244,47 @@ enum DialError {
     Sftp,
 }
 
-trait RemoteLink: Send + Sync {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkError {
+    InvalidPath,
+    NotConnected,
+    NotFound,
+    PermissionDenied,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawMeta {
+    pub is_dir: bool,
+    pub is_file: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub modified: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawFile {
+    pub name: String,
+    pub meta: RawMeta,
+}
+
+pub(crate) trait RemoteFs: Send + Sync {
+    fn list_dir<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<RawFile>, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn stat_path<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RawMeta, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+}
+
+trait RemoteLink: RemoteFs {
     fn is_closed(&self) -> bool;
     fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
@@ -384,6 +424,33 @@ impl SessionRegistry {
         };
         live.link.close().await;
         Ok(())
+    }
+
+    async fn read_dir(&self, session_id: &str, path: &str) -> Result<Vec<RawFile>, LinkError> {
+        let link = self.link_for(session_id, path)?;
+        link.list_dir(path).await
+    }
+
+    async fn stat_path(&self, session_id: &str, path: &str) -> Result<RawMeta, LinkError> {
+        let link = self.link_for(session_id, path)?;
+        link.stat_path(path).await
+    }
+
+    fn link_for(&self, session_id: &str, path: &str) -> Result<Arc<dyn RemoteLink>, LinkError> {
+        sftp::require_absolute_remote_path(path).map_err(|_| LinkError::InvalidPath)?;
+        let data = self.data.lock().map_err(|_| LinkError::Failed)?;
+        let connection_id = data
+            .by_session
+            .get(session_id)
+            .ok_or(LinkError::NotConnected)?;
+        let live = data
+            .by_connection
+            .get(connection_id)
+            .ok_or(LinkError::NotConnected)?;
+        if live.link.is_closed() {
+            return Err(LinkError::NotConnected);
+        }
+        Ok(live.link.clone())
     }
 
     fn list(&self) -> Result<Vec<SessionSummary>, SessionError> {
@@ -667,6 +734,22 @@ impl SessionState {
             .await
     }
 
+    pub(crate) async fn read_dir(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Vec<RawFile>, LinkError> {
+        self.registry.read_dir(session_id, path).await
+    }
+
+    pub(crate) async fn stat_path(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<RawMeta, LinkError> {
+        self.registry.stat_path(session_id, path).await
+    }
+
     pub async fn delete_connection(
         &self,
         database: &Database,
@@ -750,8 +833,9 @@ pub fn session_list(
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandError, DialError, DialTarget, Dialer, RemoteLink, SessionError, SessionRegistry,
-        SessionSummary, accept_server_key, matches_trusted_key, prepare_auth, same_endpoint,
+        CommandError, DialError, DialTarget, Dialer, LinkError, RawFile, RawMeta, RemoteFs,
+        RemoteLink, SessionError, SessionRegistry, SessionSummary, accept_server_key,
+        matches_trusted_key, prepare_auth, same_endpoint,
     };
     use crate::connections::AuthMethod;
     use crate::db::apply_migrations;
@@ -768,6 +852,8 @@ mod tests {
     struct FakeLink {
         closed: Arc<AtomicBool>,
     }
+
+    impl RemoteFs for FakeLink {}
 
     impl RemoteLink for FakeLink {
         fn is_closed(&self) -> bool {
@@ -1588,5 +1674,118 @@ mod tests {
             })
             .expect("count");
         assert_eq!(stored, 0);
+    }
+
+    struct ListingLink {
+        calls: AtomicUsize,
+        closed: AtomicBool,
+    }
+
+    impl RemoteFs for ListingLink {
+        fn list_dir<'a>(
+            &'a self,
+            path: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<RawFile>, LinkError>> + Send + 'a>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let path = path.to_string();
+            Box::pin(async move {
+                assert!(path.starts_with('/'));
+                Ok(vec![RawFile {
+                    name: "telegraf.conf".to_string(),
+                    meta: RawMeta {
+                        is_dir: false,
+                        is_file: true,
+                        is_symlink: false,
+                        size: 12,
+                        modified: Some(1),
+                    },
+                }])
+            })
+        }
+    }
+
+    impl RemoteLink for ListingLink {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+
+        fn close(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.closed.store(true, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    struct ListingDialer {
+        link: Arc<ListingLink>,
+    }
+
+    impl Dialer for ListingDialer {
+        async fn dial(&self, _target: DialTarget) -> Result<Arc<dyn RemoteLink>, DialError> {
+            Ok(self.link.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_uses_the_live_link_and_a_bad_path_does_not() {
+        let fixture = fixture("password", None);
+        save_password(&fixture, "hunter2-secret");
+        let link = Arc::new(ListingLink {
+            calls: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+        });
+        let dialer = ListingDialer { link: link.clone() };
+        let started = fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("connect");
+
+        let missing = fixture
+            .registry
+            .read_dir("missing", "/etc")
+            .await
+            .expect_err("missing");
+        assert!(matches!(missing, LinkError::NotConnected));
+        assert_eq!(link.calls.load(Ordering::SeqCst), 0);
+
+        let relative = fixture
+            .registry
+            .read_dir(&started.session_id, "relative.conf")
+            .await
+            .expect_err("relative");
+        assert!(matches!(relative, LinkError::InvalidPath));
+        let nul = fixture
+            .registry
+            .read_dir(&started.session_id, "/etc/\0telegraf")
+            .await
+            .expect_err("nul");
+        assert!(matches!(nul, LinkError::InvalidPath));
+        assert!(!format!("{nul:?}").contains("hunter2-secret"));
+        assert_eq!(link.calls.load(Ordering::SeqCst), 0);
+
+        let files = fixture
+            .registry
+            .read_dir(&started.session_id, "/etc/telegraf")
+            .await
+            .expect("list");
+        assert_eq!(files[0].name, "telegraf.conf");
+        assert_eq!(link.calls.load(Ordering::SeqCst), 1);
+
+        link.closed.store(true, Ordering::SeqCst);
+        let closed = fixture
+            .registry
+            .read_dir(&started.session_id, "/etc")
+            .await
+            .expect_err("closed");
+        assert!(matches!(closed, LinkError::NotConnected));
+        assert_eq!(link.calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
+  import FilePane from "$lib/components/FilePane.svelte";
   import {
     bindHostPrompt,
     blankToNull,
@@ -68,6 +69,13 @@
   let hostPrompt = $state<BoundHostPrompt | null>(null);
   let sessions = $state<LiveSession[]>([]);
   let connectingId = $state<string | null>(null);
+
+  const selected = $derived(
+    connections.find((connection) => connection.id === selectedId) ?? null,
+  );
+  const selectedSession = $derived(
+    selectedId ? (sessionForConnection(sessions, selectedId) ?? null) : null,
+  );
 
   function fill(connection: Connection) {
     selectedId = connection.id;
@@ -421,54 +429,36 @@
     {/if}
   </section>
 
-  <div class="editor">
-    <section class="hosts">
-      {#if hostPrompt}
-        <div
-          class="prompt"
-          class:changed={hostPrompt.decision === "changed"}
-          role="alert"
-        >
-          <h2>{hostKeyPromptCopy(hostPrompt.decision).title}</h2>
-          <p>
-            {hostPrompt.host}:{hostPrompt.port} · {hostPrompt.keyType}
+  <div class="workspace">
+    {#if hostPrompt}
+      <div
+        class="prompt"
+        class:changed={hostPrompt.decision === "changed"}
+        role="alert"
+      >
+        <h2>{hostKeyPromptCopy(hostPrompt.decision).title}</h2>
+        <p>
+          {hostPrompt.host}:{hostPrompt.port} · {hostPrompt.keyType}
+        </p>
+        <p class="fingerprint">{hostPrompt.fingerprint}</p>
+        {#if hostPrompt.storedFingerprint}
+          <p class="hint">
+            Previously trusted: {hostPrompt.storedFingerprint}
           </p>
-          <p class="fingerprint">{hostPrompt.fingerprint}</p>
-          {#if hostPrompt.storedFingerprint}
-            <p class="hint">
-              Previously trusted: {hostPrompt.storedFingerprint}
-            </p>
-          {/if}
-          <div class="actions">
-            <button type="button" disabled={busy} onclick={confirmHostKey}>
-              {hostKeyPromptCopy(hostPrompt.decision).confirm}
-            </button>
-            <button type="button" disabled={busy} onclick={cancelHostKey}
-              >Cancel</button
-            >
-          </div>
+        {/if}
+        <div class="actions">
+          <button type="button" disabled={busy} onclick={confirmHostKey}>
+            {hostKeyPromptCopy(hostPrompt.decision).confirm}
+          </button>
+          <button type="button" disabled={busy} onclick={cancelHostKey}
+            >Cancel</button
+          >
         </div>
-      {/if}
-      <h2>Trusted hosts</h2>
-      {#if trustedHosts.length === 0}
-        <p class="empty">No host keys trusted yet.</p>
-      {:else}
-        <ul>
-          {#each trustedHosts as host (host.id)}
-            <li>
-              <span>{host.host}:{host.port}</span>
-              <small>{host.fingerprint}</small>
-              <button
-                type="button"
-                disabled={busy}
-                onclick={() => forgetHost(host.id)}>Forget</button
-              >
-            </li>
-          {/each}
-        </ul>
-      {/if}
-    </section>
-
+      </div>
+    {/if}
+    {#if errorMessage}
+      <p class="error banner" role="alert">{errorMessage}</p>
+    {/if}
     {#if locked}
       <form class="vault" onsubmit={unlock}>
         <h2>
@@ -516,139 +506,185 @@
         </button>
       </form>
     {/if}
-
-    <form onsubmit={save}>
-      <h2>{selectedId ? "Edit connection" : "New connection"}</h2>
-      <p class="hint">
-        {#if hasCredential}
-          A secret is saved. Leave the fields blank to keep it, or type a
-          replacement.
-        {:else if locked}
-          Unlock the vault before saving a password or key.
+    <div class="pane-slot">
+      <FilePane
+        {connections}
+        connection={selected}
+        session={selectedSession}
+        connecting={connectingId !== null && connectingId === selectedId}
+        connectDisabled={busy || connectingId !== null || hostPrompt !== null}
+        onSelect={(id) => {
+          const connection = connections.find((item) => item.id === id);
+          if (connection) {
+            fill(connection);
+          }
+        }}
+        onConnect={connectSelected}
+        onDisconnect={disconnectSelected}
+        onSessionLost={() => {
+          void refresh().catch(showError);
+        }}
+      />
+    </div>
+    <details class="settings" open>
+      <summary>Connection settings</summary>
+      <section class="hosts">
+        <h2>Trusted hosts</h2>
+        {#if trustedHosts.length === 0}
+          <p class="empty">No host keys trusted yet.</p>
         {:else}
-          Passwords and private keys are encrypted in the local vault.
+          <ul>
+            {#each trustedHosts as host (host.id)}
+              <li>
+                <span>{host.host}:{host.port}</span>
+                <small>{host.fingerprint}</small>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onclick={() => forgetHost(host.id)}>Forget</button
+                >
+              </li>
+            {/each}
+          </ul>
         {/if}
-      </p>
+      </section>
 
-      <label>
-        Name
-        <input bind:value={name} autocomplete="off" required />
-      </label>
-      <label>
-        Host
-        <input
-          bind:value={host}
-          autocomplete="off"
-          spellcheck="false"
-          required
-        />
-      </label>
-      <label>
-        Port
-        <input bind:value={port} type="number" min="1" max="65535" required />
-      </label>
-      <label>
-        Username
-        <input
-          bind:value={username}
-          autocomplete="off"
-          spellcheck="false"
-          required
-        />
-      </label>
-      <label>
-        Authentication
-        <select bind:value={authMethod}>
-          {#each methods as method (method.value)}
-            <option value={method.value}>{method.label}</option>
-          {/each}
-        </select>
-      </label>
-      {#if authMethod === "key_file"}
+      <form onsubmit={save}>
+        <h2>{selectedId ? "Edit connection" : "New connection"}</h2>
+        <p class="hint">
+          {#if hasCredential}
+            A secret is saved. Leave the fields blank to keep it, or type a
+            replacement.
+          {:else if locked}
+            Unlock the vault before saving a password or key.
+          {:else}
+            Passwords and private keys are encrypted in the local vault.
+          {/if}
+        </p>
+
         <label>
-          Key file path
-          <input bind:value={keyPath} autocomplete="off" spellcheck="false" />
+          Name
+          <input bind:value={name} autocomplete="off" required />
         </label>
-      {/if}
-      {#if authMethod === "password"}
         <label>
-          Password
+          Host
           <input
-            type="password"
-            bind:value={password}
-            autocomplete="new-password"
-            disabled={locked}
-            placeholder={hasCredential ? "Saved — type to replace" : ""}
-          />
-        </label>
-      {/if}
-      {#if authMethod === "private_key"}
-        <label>
-          Private key
-          <textarea
-            bind:value={privateKeyPem}
-            rows="6"
+            bind:value={host}
+            autocomplete="off"
             spellcheck="false"
-            disabled={locked}
-            placeholder={hasCredential
-              ? "Saved — paste a new key to replace"
-              : ""}
-          ></textarea>
-        </label>
-      {/if}
-      {#if authMethod === "private_key" || authMethod === "key_file"}
-        <label>
-          Key passphrase
-          <input
-            type="password"
-            bind:value={passphrase}
-            autocomplete="new-password"
-            disabled={locked}
-            placeholder={hasCredential ? "Saved — type to replace" : ""}
+            required
           />
         </label>
-      {/if}
-      <label>
-        Default remote path
-        <input bind:value={defaultPath} autocomplete="off" spellcheck="false" />
-      </label>
-      <label>
-        Notes
-        <textarea bind:value={notes} rows="4"></textarea>
-      </label>
+        <label>
+          Port
+          <input bind:value={port} type="number" min="1" max="65535" required />
+        </label>
+        <label>
+          Username
+          <input
+            bind:value={username}
+            autocomplete="off"
+            spellcheck="false"
+            required
+          />
+        </label>
+        <label>
+          Authentication
+          <select bind:value={authMethod}>
+            {#each methods as method (method.value)}
+              <option value={method.value}>{method.label}</option>
+            {/each}
+          </select>
+        </label>
+        {#if authMethod === "key_file"}
+          <label>
+            Key file path
+            <input bind:value={keyPath} autocomplete="off" spellcheck="false" />
+          </label>
+        {/if}
+        {#if authMethod === "password"}
+          <label>
+            Password
+            <input
+              type="password"
+              bind:value={password}
+              autocomplete="new-password"
+              disabled={locked}
+              placeholder={hasCredential ? "Saved — type to replace" : ""}
+            />
+          </label>
+        {/if}
+        {#if authMethod === "private_key"}
+          <label>
+            Private key
+            <textarea
+              bind:value={privateKeyPem}
+              rows="6"
+              spellcheck="false"
+              disabled={locked}
+              placeholder={hasCredential
+                ? "Saved — paste a new key to replace"
+                : ""}
+            ></textarea>
+          </label>
+        {/if}
+        {#if authMethod === "private_key" || authMethod === "key_file"}
+          <label>
+            Key passphrase
+            <input
+              type="password"
+              bind:value={passphrase}
+              autocomplete="new-password"
+              disabled={locked}
+              placeholder={hasCredential ? "Saved — type to replace" : ""}
+            />
+          </label>
+        {/if}
+        <label>
+          Default remote path
+          <input
+            bind:value={defaultPath}
+            autocomplete="off"
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          Notes
+          <textarea bind:value={notes} rows="4"></textarea>
+        </label>
 
-      {#if errorMessage}
-        <p class="error" role="alert">{errorMessage}</p>
-      {/if}
-
-      <div class="actions">
-        <button type="submit" disabled={busy}>Save</button>
-        {#if selectedId}
-          <button
-            type="button"
-            disabled={busy || connectingId !== null || hostPrompt !== null}
-            onclick={connectSelected}
-          >
-            {connectingId === selectedId ? "Connecting…" : "Connect"}
-          </button>
-        {/if}
-        {#if selectedId && sessionForConnection(sessions, selectedId)}
-          <button type="button" disabled={busy} onclick={disconnectSelected}
-            >Disconnect</button
-          >
-        {/if}
-        {#if selectedId && hasCredential && !locked}
-          <button type="button" disabled={busy} onclick={clearSecret}
-            >Remove secret</button
-          >
-        {/if}
-        {#if selectedId}
-          <button type="button" class="danger" disabled={busy} onclick={remove}
-            >Delete</button
-          >
-        {/if}
-      </div>
-    </form>
+        <div class="actions">
+          <button type="submit" disabled={busy}>Save</button>
+          {#if selectedId}
+            <button
+              type="button"
+              disabled={busy || connectingId !== null || hostPrompt !== null}
+              onclick={connectSelected}
+            >
+              {connectingId === selectedId ? "Connecting…" : "Connect"}
+            </button>
+          {/if}
+          {#if selectedId && sessionForConnection(sessions, selectedId)}
+            <button type="button" disabled={busy} onclick={disconnectSelected}
+              >Disconnect</button
+            >
+          {/if}
+          {#if selectedId && hasCredential && !locked}
+            <button type="button" disabled={busy} onclick={clearSecret}
+              >Remove secret</button
+            >
+          {/if}
+          {#if selectedId}
+            <button
+              type="button"
+              class="danger"
+              disabled={busy}
+              onclick={remove}>Delete</button
+            >
+          {/if}
+        </div>
+      </form>
+    </details>
   </div>
 </main>
 
@@ -660,20 +696,48 @@
     color: CanvasText;
   }
 
+  :global(body) {
+    margin: 0;
+  }
+
   main {
-    min-height: 100vh;
+    height: 100vh;
     margin: 0;
     display: grid;
     grid-template-columns: 18rem minmax(0, 1fr);
+    overflow: hidden;
   }
 
   .list {
     border-right: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
     padding: 1rem;
+    overflow: auto;
   }
 
-  .editor {
+  .workspace {
     min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .pane-slot {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .settings {
+    flex: 0 1 38%;
+    overflow: auto;
+    border-top: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  }
+
+  .settings summary {
+    padding: 0.65rem 1rem;
+    cursor: pointer;
   }
 
   header,
@@ -751,6 +815,11 @@
     border: 1px solid color-mix(in srgb, CanvasText 28%, transparent);
     border-radius: 8px;
     padding: 0.8rem;
+    margin: 0.75rem 1rem 0;
+  }
+
+  .banner {
+    margin: 0.75rem 1rem 0;
   }
 
   .prompt.changed {
@@ -796,7 +865,17 @@
 
   @media (max-width: 720px) {
     main {
+      height: auto;
+      overflow: visible;
       grid-template-columns: 1fr;
+    }
+
+    .workspace {
+      min-height: 100vh;
+    }
+
+    .pane-slot {
+      min-height: 24rem;
     }
 
     .list {

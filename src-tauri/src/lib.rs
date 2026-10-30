@@ -1,5 +1,6 @@
 mod connections;
 mod db;
+mod fs;
 mod known_hosts;
 mod menu;
 mod session;
@@ -45,6 +46,8 @@ pub fn run() {
             session::session_trust_host,
             session::session_disconnect,
             session::session_list,
+            fs::fs_list,
+            fs::fs_stat,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())
