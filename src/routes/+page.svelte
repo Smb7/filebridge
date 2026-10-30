@@ -2,6 +2,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import FilePane from "$lib/components/FilePane.svelte";
+  import TerminalPane from "$lib/components/TerminalPane.svelte";
   import {
     bindHostPrompt,
     blankToNull,
@@ -817,7 +818,13 @@
         </div>
       {/each}
     </div>
-    <details class="settings" open>
+    <div class="terminal-slot">
+      <TerminalPane
+        {sessions}
+        preferredSessionId={sessionIdFor(panes[panes.focused].connectionId)}
+      />
+    </div>
+    <details class="settings">
       <summary>Connection settings</summary>
       <section class="hosts">
         <h2>Trusted hosts</h2>
@@ -1039,6 +1046,12 @@
 
   .pane-slot + .pane-slot {
     border-left: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
+  }
+
+  .terminal-slot {
+    flex: 0 0 12.5rem;
+    min-height: 0;
+    border-top: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
   }
 
   .settings {

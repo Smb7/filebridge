@@ -361,3 +361,31 @@ export function transferStart(input: {
 export function transferCancel(transferId: string): Promise<void> {
   return command("transfer_cancel", { transferId });
 }
+
+export type TermOpened = {
+  termId: string;
+};
+
+export function termOpen(
+  sessionId: string,
+  cols: number,
+  rows: number,
+): Promise<TermOpened> {
+  return command("term_open", { sessionId, cols, rows });
+}
+
+export function termWrite(termId: string, data: string): Promise<void> {
+  return command("term_write", { termId, data });
+}
+
+export function termResize(
+  termId: string,
+  cols: number,
+  rows: number,
+): Promise<void> {
+  return command("term_resize", { termId, cols, rows });
+}
+
+export function termClose(termId: string): Promise<void> {
+  return command("term_close", { termId });
+}

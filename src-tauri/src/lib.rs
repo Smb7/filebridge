@@ -4,6 +4,7 @@ mod fs;
 mod known_hosts;
 mod menu;
 mod session;
+mod term;
 mod transfer;
 mod vault;
 
@@ -26,6 +27,7 @@ pub fn run() {
             app.manage(vault::VaultState::system());
             app.manage(known_hosts::HostKeyState::new());
             app.manage(session::SessionState::new());
+            app.manage(term::TerminalState::new());
             app.manage(transfer::TransferState::new());
             app.manage(database);
             Ok(())
@@ -55,6 +57,10 @@ pub fn run() {
             fs::fs_delete,
             transfer::transfer_start,
             transfer::transfer_cancel,
+            term::term_open,
+            term::term_write,
+            term::term_resize,
+            term::term_close,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())
