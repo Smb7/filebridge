@@ -287,6 +287,94 @@ impl RusshLink {
             Err(_) => Err(LinkError::InvalidPath),
         }
     }
+
+    async fn read_remote_lstat(&self, path: &str) -> Result<RawMeta, LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let session = sftp.lock().await;
+                let metadata = session
+                    .symlink_metadata(&absolute)
+                    .await
+                    .map_err(map_client_error)?;
+                Ok(meta_from(&metadata))
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn create_remote_dir(&self, path: &str) -> Result<(), LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let session = sftp.lock().await;
+                session
+                    .create_dir(&absolute)
+                    .await
+                    .map_err(map_client_error)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn rename_remote(&self, from: &str, to: &str) -> Result<(), LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run_two(from, to, |from, to| async move {
+                let session = sftp.lock().await;
+                session.rename(&from, &to).await.map_err(map_client_error)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn remove_remote_file(&self, path: &str) -> Result<(), LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let session = sftp.lock().await;
+                session
+                    .remove_file(&absolute)
+                    .await
+                    .map_err(map_client_error)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn remove_remote_dir(&self, path: &str) -> Result<(), LinkError> {
+        let sftp = &self.sftp;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let session = sftp.lock().await;
+                session
+                    .remove_dir(&absolute)
+                    .await
+                    .map_err(map_client_error)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
 }
 
 impl RemoteFs for RusshLink {
@@ -305,6 +393,47 @@ impl RemoteFs for RusshLink {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RawMeta, LinkError>> + Send + 'a>>
     {
         Box::pin(self.read_remote_stat(path))
+    }
+
+    fn lstat_path<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RawMeta, LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.read_remote_lstat(path))
+    }
+
+    fn create_dir<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.create_remote_dir(path))
+    }
+
+    fn rename_path<'a>(
+        &'a self,
+        from: &'a str,
+        to: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.rename_remote(from, to))
+    }
+
+    fn remove_file<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.remove_remote_file(path))
+    }
+
+    fn remove_dir<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.remove_remote_dir(path))
     }
 }
 
@@ -394,6 +523,11 @@ mod tests {
         assert!(matches!(
             super::link_error_from_code(russh_sftp::protocol::StatusCode::NoSuchFile),
             super::LinkError::NotFound
+        ));
+        // A generic failure is not a request to delete children.
+        assert!(matches!(
+            super::link_error_from_code(russh_sftp::protocol::StatusCode::Failure),
+            super::LinkError::Failed
         ));
     }
 

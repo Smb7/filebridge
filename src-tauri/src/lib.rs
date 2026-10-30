@@ -48,6 +48,9 @@ pub fn run() {
             session::session_list,
             fs::fs_list,
             fs::fs_stat,
+            fs::fs_mkdir,
+            fs::fs_rename,
+            fs::fs_delete,
         ])
         .on_menu_event(|app, event| menu::handle_event(app, event.id().as_ref()))
         .run(tauri::generate_context!())

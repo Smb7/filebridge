@@ -211,15 +211,20 @@ describe("file list keyboard and window", () => {
     entry("mem.conf"),
   ];
 
-  it("maps file-list keys and ignores delete, copy, and modified keys", () => {
+  it("maps file-list keys and keeps copy and modified keys alone", () => {
     expect(listKeyAction("ArrowDown")).toEqual({ type: "move", delta: 1 });
     expect(listKeyAction("ArrowUp")).toEqual({ type: "move", delta: -1 });
     expect(listKeyAction("Enter")).toEqual({ type: "open" });
     expect(listKeyAction("Backspace")).toEqual({ type: "parent" });
     expect(listKeyAction("F5")).toEqual({ type: "refresh" });
+    expect(listKeyAction("F2")).toEqual({ type: "rename" });
+    expect(listKeyAction("Delete")).toEqual({ type: "delete" });
     expect(listKeyAction("Tab")).toEqual({ type: "focus-other" });
     expect(listKeyAction("Tab", { shift: true })).toEqual({ type: "ignore" });
-    expect(listKeyAction("Delete")).toEqual({ type: "ignore" });
+    expect(listKeyAction("Delete", { shift: true })).toEqual({
+      type: "ignore",
+    });
+    expect(listKeyAction("F2", { ctrl: true })).toEqual({ type: "ignore" });
     expect(listKeyAction("c", { ctrl: true })).toEqual({ type: "ignore" });
     expect(listKeyAction("F5", { ctrl: true })).toEqual({ type: "ignore" });
   });
