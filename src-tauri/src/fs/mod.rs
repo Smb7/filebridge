@@ -36,12 +36,25 @@ impl From<LinkError> for CommandError {
             LinkError::NotConnected => ("not_connected", "That server is not connected."),
             LinkError::NotFound => ("not_found", "That path does not exist."),
             LinkError::PermissionDenied => ("permission_denied", "Permission denied."),
+            LinkError::NotEmpty => ("not_empty", "That folder is not empty."),
+            LinkError::AlreadyExists => ("already_exists", "That name already exists."),
+            LinkError::NotAllowed => ("not_allowed", "That path cannot be changed."),
             LinkError::Failed => ("sftp_failed", "Could not read that path."),
         };
         Self {
             code,
             message: message.to_string(),
         }
+    }
+}
+
+fn mutation_error(error: LinkError) -> CommandError {
+    match error {
+        LinkError::Failed => CommandError {
+            code: "sftp_failed",
+            message: "Could not change that path.".to_string(),
+        },
+        other => CommandError::from(other),
     }
 }
 
@@ -137,9 +150,52 @@ pub async fn fs_stat(
     Ok(entry_from_meta(&path, meta))
 }
 
+#[tauri::command]
+pub async fn fs_mkdir(
+    sessions: tauri::State<'_, SessionState>,
+    session_id: String,
+    path: String,
+) -> Result<(), CommandError> {
+    let path = path::normalize_remote_path(&path)?;
+    sessions
+        .create_dir(&session_id, &path)
+        .await
+        .map_err(mutation_error)
+}
+
+#[tauri::command]
+pub async fn fs_rename(
+    sessions: tauri::State<'_, SessionState>,
+    session_id: String,
+    from: String,
+    to: String,
+) -> Result<(), CommandError> {
+    let from = path::normalize_remote_path(&from)?;
+    let to = path::normalize_remote_path(&to)?;
+    sessions
+        .rename_path(&session_id, &from, &to)
+        .await
+        .map_err(mutation_error)
+}
+
+#[tauri::command]
+pub async fn fs_delete(
+    sessions: tauri::State<'_, SessionState>,
+    session_id: String,
+    path: String,
+) -> Result<(), CommandError> {
+    let path = path::normalize_remote_path(&path)?;
+    sessions
+        .remove_path(&session_id, &path)
+        .await
+        .map_err(mutation_error)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CommandError, EntryKind, entry_from_meta, kind_from_flags, prepare_listing};
+    use super::{
+        CommandError, EntryKind, entry_from_meta, kind_from_flags, mutation_error, prepare_listing,
+    };
     use crate::session::{LinkError, RawFile, RawMeta};
 
     fn file(name: &str, is_dir: bool) -> RawFile {
@@ -198,6 +254,9 @@ mod tests {
             LinkError::NotConnected,
             LinkError::NotFound,
             LinkError::PermissionDenied,
+            LinkError::NotEmpty,
+            LinkError::AlreadyExists,
+            LinkError::NotAllowed,
             LinkError::Failed,
         ] {
             let command = CommandError::from(error);
@@ -206,7 +265,25 @@ mod tests {
             assert!(!rendered.to_lowercase().contains("password"));
             assert!(!rendered.to_lowercase().contains("passphrase"));
             assert!(!rendered.to_lowercase().contains("private"));
+            assert!(!rendered.to_lowercase().contains("sudo"));
         }
+    }
+
+    #[test]
+    fn a_change_is_shown_as_returned_and_does_not_offer_sudo() {
+        let denied = mutation_error(LinkError::PermissionDenied);
+        assert_eq!(denied.code, "permission_denied");
+        assert_eq!(denied.message, "Permission denied.");
+        assert!(!denied.message.to_lowercase().contains("sudo"));
+
+        let failed = mutation_error(LinkError::Failed);
+        assert_eq!(failed.code, "sftp_failed");
+        assert_eq!(failed.message, "Could not change that path.");
+        assert!(!failed.message.contains("hunter2-secret"));
+
+        let occupied = mutation_error(LinkError::NotEmpty);
+        assert_eq!(occupied.code, "not_empty");
+        assert_eq!(occupied.message, "That folder is not empty.");
     }
 
     #[test]

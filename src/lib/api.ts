@@ -318,3 +318,19 @@ export function fsList(sessionId: string, path: string): Promise<DirEntry[]> {
 export function fsStat(sessionId: string, path: string): Promise<DirEntry> {
   return command("fs_stat", { sessionId, path });
 }
+
+export function fsMkdir(sessionId: string, path: string): Promise<void> {
+  return command("fs_mkdir", { sessionId, path });
+}
+
+export function fsRename(
+  sessionId: string,
+  from: string,
+  to: string,
+): Promise<void> {
+  return command("fs_rename", { sessionId, from, to });
+}
+
+export function fsDelete(sessionId: string, path: string): Promise<void> {
+  return command("fs_delete", { sessionId, path });
+}

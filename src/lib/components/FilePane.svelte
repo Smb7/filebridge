@@ -1,12 +1,22 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import {
+    fsDelete,
     fsList,
+    fsMkdir,
+    fsRename,
     fsStat,
     isAppError,
     type Connection,
     type LiveSession,
   } from "$lib/api";
+  import {
+    confirmedDelete,
+    deletePrompt,
+    neighborName,
+    planMkdir,
+    planRename,
+  } from "$lib/fileOps";
   import {
     FILE_OPEN_LATER,
     ROW_HEIGHT,
@@ -78,6 +88,16 @@
   let viewport = $state<HTMLDivElement | null>(null);
   let paneRoot = $state<HTMLElement | null>(null);
   let appliedFocus = 0;
+  let namingMode = $state<"mkdir" | "rename" | null>(null);
+  let nameDraft = $state("");
+  let namedIn = $state<string | null>(null);
+  let pendingDelete = $state<{
+    path: string;
+    name: string;
+    message: string;
+  } | null>(null);
+  let acting = $state(false);
+  let nameInput = $state<HTMLInputElement | null>(null);
 
   const header = $derived(paneHeader(connection, focused));
   const pathValue = $derived(browser.draft ?? browser.path);
@@ -91,6 +111,9 @@
   );
   const visible = $derived(browser.entries.slice(range.start, range.end));
   const status = $derived.by(() => {
+    if (acting) {
+      return "Working…";
+    }
     if (browser.listing) {
       return "Listing…";
     }
@@ -115,6 +138,170 @@
 
   function messageOf(error: unknown): string {
     return isAppError(error) ? error.message : "Could not read that path.";
+  }
+
+  function changeMessage(error: unknown): string {
+    return isAppError(error) ? error.message : "Could not change that path.";
+  }
+
+  function selectedEntry(): DirEntry | null {
+    return (
+      browser.entries.find((item) => item.name === browser.selectedName) ?? null
+    );
+  }
+
+  function lostSession(error: unknown) {
+    if (
+      isAppError(error) &&
+      (error.code === "not_connected" || error.code === "sftp_unavailable")
+    ) {
+      onSessionLost();
+    }
+  }
+
+  function cancelPrompt() {
+    namingMode = null;
+    nameDraft = "";
+    namedIn = null;
+    pendingDelete = null;
+  }
+
+  async function focusName() {
+    await tick();
+    nameInput?.focus();
+    nameInput?.select();
+  }
+
+  function startMkdir() {
+    if (!session || acting) {
+      return;
+    }
+    pendingDelete = null;
+    namingMode = "mkdir";
+    nameDraft = "";
+    namedIn = browser.path;
+    void focusName();
+  }
+
+  function startRename() {
+    const selected = selectedEntry();
+    if (!session || !selected || acting) {
+      return;
+    }
+    pendingDelete = null;
+    namingMode = "rename";
+    nameDraft = selected.name;
+    namedIn = browser.path;
+    void focusName();
+  }
+
+  function startDelete() {
+    const selected = selectedEntry();
+    if (!session || !selected || acting) {
+      return;
+    }
+    const prompt = deletePrompt(selected);
+    namingMode = null;
+    if (!prompt.ok) {
+      browser = { ...browser, error: prompt.message };
+      pendingDelete = null;
+      return;
+    }
+    pendingDelete = {
+      path: prompt.path,
+      name: selected.name,
+      message: prompt.message,
+    };
+  }
+
+  async function submitName(event?: Event) {
+    event?.preventDefault();
+    if (!session || !namingMode || acting) {
+      return;
+    }
+    const selected = selectedEntry();
+    const planned =
+      namingMode === "mkdir"
+        ? planMkdir(browser.path, nameDraft)
+        : selected
+          ? planRename(selected, nameDraft)
+          : { ok: false as const, message: "Select a file to rename." };
+    if (!planned.ok) {
+      browser = { ...browser, error: planned.message };
+      return;
+    }
+    if ("unchanged" in planned && planned.unchanged) {
+      cancelPrompt();
+      return;
+    }
+    const generation = browser.generation;
+    const sessionId = session.sessionId;
+    const directory = browser.path;
+    const selectName = planned.name;
+    acting = true;
+    browser = { ...browser, error: null };
+    try {
+      if ("path" in planned) {
+        await fsMkdir(sessionId, planned.path);
+      } else {
+        await fsRename(sessionId, planned.from, planned.to);
+      }
+      cancelPrompt();
+      if (
+        browser.generation !== generation ||
+        session?.sessionId !== sessionId
+      ) {
+        return;
+      }
+      browser = { ...browser, selectedName: selectName, error: null };
+      await load(sessionId, directory);
+    } catch (error) {
+      if (browser.generation !== generation) {
+        return;
+      }
+      browser = { ...browser, error: changeMessage(error) };
+      lostSession(error);
+    } finally {
+      acting = false;
+    }
+  }
+
+  async function confirmDelete() {
+    const selected = selectedEntry();
+    const path = confirmedDelete(
+      pendingDelete?.path ?? null,
+      selected?.path ?? null,
+    );
+    if (!path || !session || acting) {
+      pendingDelete = null;
+      return;
+    }
+    const generation = browser.generation;
+    const sessionId = session.sessionId;
+    const directory = browser.path;
+    const next = neighborName(browser.entries, selected?.name ?? "");
+    acting = true;
+    pendingDelete = null;
+    browser = { ...browser, error: null };
+    try {
+      await fsDelete(sessionId, path);
+      if (
+        browser.generation !== generation ||
+        session?.sessionId !== sessionId
+      ) {
+        return;
+      }
+      browser = { ...browser, selectedName: next, error: null };
+      await load(sessionId, directory);
+    } catch (error) {
+      if (browser.generation !== generation) {
+        return;
+      }
+      browser = { ...browser, error: changeMessage(error) };
+      lostSession(error);
+    } finally {
+      acting = false;
+    }
   }
 
   function measure() {
@@ -233,7 +420,21 @@
     }
   }
 
+  function onNameKey(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelPrompt();
+    }
+  }
+
   function onListKey(event: KeyboardEvent) {
+    if (namingMode || pendingDelete) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelPrompt();
+      }
+      return;
+    }
     const action = listKeyAction(event.key, {
       alt: event.altKey,
       ctrl: event.ctrlKey,
@@ -273,6 +474,14 @@
       void load(session.sessionId, browser.path);
       return;
     }
+    if (action.type === "rename") {
+      startRename();
+      return;
+    }
+    if (action.type === "delete") {
+      startDelete();
+      return;
+    }
     const selected = browser.entries.find(
       (item) => item.name === browser.selectedName,
     );
@@ -294,6 +503,8 @@
     }
     const previous = seenSession;
     seenSession = id;
+    namingMode = null;
+    pendingDelete = null;
     if (!id) {
       if (previous !== null) {
         browser = clearBrowser(browser);
@@ -306,6 +517,17 @@
 
   $effect(() => {
     onDirectory(browser.path);
+  });
+
+  $effect(() => {
+    const selected = browser.selectedName;
+    const directory = browser.path;
+    if (pendingDelete && pendingDelete.name !== selected) {
+      pendingDelete = null;
+    }
+    if (namingMode && namedIn !== directory) {
+      namingMode = null;
+    }
   });
 
   $effect(() => {
@@ -408,6 +630,61 @@
     <p class="error" role="alert">{browser.pathError}</p>
   {/if}
 
+  <div class="actions">
+    <button type="button" disabled={!session || acting} onclick={startMkdir}>
+      New folder
+    </button>
+    <button
+      type="button"
+      disabled={!session || !browser.selectedName || acting}
+      onclick={startRename}
+    >
+      Rename
+    </button>
+    <button
+      type="button"
+      disabled={!session || !browser.selectedName || acting}
+      onclick={startDelete}
+    >
+      Delete
+    </button>
+  </div>
+
+  {#if namingMode}
+    <form class="prompt" onsubmit={submitName}>
+      <label>
+        {namingMode === "mkdir" ? "Folder name" : "New name"}
+        <input
+          bind:this={nameInput}
+          bind:value={nameDraft}
+          spellcheck="false"
+          autocomplete="off"
+          autocapitalize="off"
+          disabled={acting}
+          onkeydown={onNameKey}
+        />
+      </label>
+      <button type="submit" disabled={acting}>
+        {namingMode === "mkdir" ? "Create" : "Rename"}
+      </button>
+      <button type="button" disabled={acting} onclick={cancelPrompt}>
+        Cancel
+      </button>
+    </form>
+  {/if}
+
+  {#if pendingDelete}
+    <div class="confirm" role="group" aria-label="Confirm delete">
+      <p>{pendingDelete.message}</p>
+      <button type="button" disabled={acting} onclick={confirmDelete}>
+        Delete
+      </button>
+      <button type="button" disabled={acting} onclick={cancelPrompt}>
+        Cancel
+      </button>
+    </div>
+  {/if}
+
   <div
     class="viewport"
     role="listbox"
@@ -448,7 +725,7 @@
   </div>
   <p class="status" id="list-keys">
     {status}
-    <span class="keys">Up/Down, Enter, Backspace, F5, Tab</span>
+    <span class="keys">Up/Down, Enter, Backspace, F5, Tab, F2, Delete</span>
   </p>
 </section>
 
@@ -476,6 +753,9 @@
   header,
   .controls,
   .path,
+  .actions,
+  .prompt,
+  .confirm,
   .row {
     display: flex;
     gap: 0.75rem;
@@ -534,6 +814,31 @@
 
   .path {
     flex: 0 0 auto;
+  }
+
+  .actions,
+  .prompt,
+  .confirm {
+    align-items: center;
+    flex: 0 0 auto;
+    gap: 0.45rem;
+  }
+
+  .prompt label {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 0;
+  }
+
+  .confirm p {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .confirm button:first-of-type {
+    border-color: color-mix(in srgb, red 55%, CanvasText);
   }
 
   button,
