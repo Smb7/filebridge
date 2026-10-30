@@ -1,4 +1,4 @@
-mod path;
+pub(crate) mod path;
 
 use serde::Serialize;
 

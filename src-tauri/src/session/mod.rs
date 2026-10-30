@@ -1,5 +1,5 @@
 mod dial;
-mod ops;
+pub(crate) mod ops;
 mod sftp;
 
 use std::collections::HashMap;
@@ -322,6 +322,43 @@ pub(crate) trait RemoteFs: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
         Box::pin(async { Err(LinkError::Failed) })
     }
+
+    fn open_read<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn read_open<'a>(
+        &'a self,
+        _token: &'a str,
+        _max: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn open_write<'a>(
+        &'a self,
+        _path: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn write_open<'a>(
+        &'a self,
+        _token: &'a str,
+        _data: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
+
+    fn close_open<'a>(
+        &'a self,
+        _token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LinkError>> + Send + 'a>> {
+        Box::pin(async { Err(LinkError::Failed) })
+    }
 }
 
 trait RemoteLink: RemoteFs {
@@ -525,8 +562,63 @@ impl SessionRegistry {
         }
     }
 
+    async fn lstat_path(&self, session_id: &str, path: &str) -> Result<RawMeta, LinkError> {
+        let link = self.link_for(session_id, path)?;
+        link.lstat_path(path).await
+    }
+
+    async fn open_read(&self, session_id: &str, path: &str) -> Result<String, LinkError> {
+        let link = self.link_for(session_id, path)?;
+        link.open_read(path).await
+    }
+
+    async fn read_open(
+        &self,
+        session_id: &str,
+        token: &str,
+        max: u32,
+    ) -> Result<Vec<u8>, LinkError> {
+        let link = self.link_of(session_id)?;
+        link.read_open(token, max).await
+    }
+
+    async fn open_write(&self, session_id: &str, path: &str) -> Result<String, LinkError> {
+        let link = self.link_for(session_id, path)?;
+        link.open_write(path).await
+    }
+
+    async fn write_open(
+        &self,
+        session_id: &str,
+        token: &str,
+        data: &[u8],
+    ) -> Result<(), LinkError> {
+        let link = self.link_of(session_id)?;
+        link.write_open(token, data).await
+    }
+
+    async fn close_open(&self, session_id: &str, token: &str) -> Result<(), LinkError> {
+        let link = self.link_of(session_id)?;
+        link.close_open(token).await
+    }
+
+    async fn remove_file(&self, session_id: &str, path: &str) -> Result<(), LinkError> {
+        let link = self.link_for(session_id, path)?;
+        link.remove_file(path).await
+    }
+
+    async fn rename_file(&self, session_id: &str, from: &str, to: &str) -> Result<(), LinkError> {
+        sftp::require_absolute_remote_path(to).map_err(|_| LinkError::InvalidPath)?;
+        let link = self.link_for(session_id, from)?;
+        link.rename_path(from, to).await
+    }
+
     fn link_for(&self, session_id: &str, path: &str) -> Result<Arc<dyn RemoteLink>, LinkError> {
         sftp::require_absolute_remote_path(path).map_err(|_| LinkError::InvalidPath)?;
+        self.link_of(session_id)
+    }
+
+    fn link_of(&self, session_id: &str) -> Result<Arc<dyn RemoteLink>, LinkError> {
         let data = self.data.lock().map_err(|_| LinkError::Failed)?;
         let connection_id = data
             .by_session
@@ -854,6 +946,73 @@ impl SessionState {
 
     pub(crate) async fn remove_path(&self, session_id: &str, path: &str) -> Result<(), LinkError> {
         self.registry.remove_path(session_id, path).await
+    }
+
+    pub(crate) async fn transfer_lstat(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<RawMeta, LinkError> {
+        self.registry.lstat_path(session_id, path).await
+    }
+
+    pub(crate) async fn transfer_open_read(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<String, LinkError> {
+        self.registry.open_read(session_id, path).await
+    }
+
+    pub(crate) async fn transfer_read(
+        &self,
+        session_id: &str,
+        token: &str,
+        max: u32,
+    ) -> Result<Vec<u8>, LinkError> {
+        self.registry.read_open(session_id, token, max).await
+    }
+
+    pub(crate) async fn transfer_open_write(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<String, LinkError> {
+        self.registry.open_write(session_id, path).await
+    }
+
+    pub(crate) async fn transfer_write(
+        &self,
+        session_id: &str,
+        token: &str,
+        data: &[u8],
+    ) -> Result<(), LinkError> {
+        self.registry.write_open(session_id, token, data).await
+    }
+
+    pub(crate) async fn transfer_close(
+        &self,
+        session_id: &str,
+        token: &str,
+    ) -> Result<(), LinkError> {
+        self.registry.close_open(session_id, token).await
+    }
+
+    pub(crate) async fn transfer_remove(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<(), LinkError> {
+        self.registry.remove_file(session_id, path).await
+    }
+
+    pub(crate) async fn transfer_rename(
+        &self,
+        session_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<(), LinkError> {
+        self.registry.rename_file(session_id, from, to).await
     }
 
     pub async fn delete_connection(

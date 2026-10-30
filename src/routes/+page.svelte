@@ -22,6 +22,8 @@
     sessionForConnection,
     sessionList,
     sessionTrustHost,
+    transferCancel,
+    transferStart,
     vaultClearCredential,
     vaultHasCredential,
     vaultInitPassword,
@@ -34,6 +36,7 @@
     type HostKeyPrompt,
     type LiveSession,
     type TrustedHost,
+    type TransferProgress,
     type VaultMode,
   } from "$lib/api";
   import { startingPath } from "$lib/browser";
@@ -50,6 +53,15 @@
     setDirectory,
     type PaneSide,
   } from "$lib/panes";
+  import {
+    reduceTransfer,
+    rememberUnmatched,
+    takeBuffered,
+    transferStatusText,
+    type FileRef,
+    type StartRequest,
+    type TrackedTransfer,
+  } from "$lib/transfer";
 
   const methods: { value: AuthMethod; label: string }[] = [
     { value: "password", label: "Password" },
@@ -85,6 +97,19 @@
   let connectingId = $state<string | null>(null);
   let panes = $state(createDualPane());
   let focusToken = $state({ left: 0, right: 0 });
+  let marked = $state<FileRef | null>(null);
+  let reloadToken = $state({ left: 0, right: 0 });
+  type TrackedJob = TrackedTransfer & {
+    side: PaneSide;
+    request: StartRequest;
+  };
+  let jobs = $state<Record<string, TrackedJob>>({});
+  let conflict = $state<{
+    side: PaneSide;
+    message: string;
+    request: StartRequest;
+  } | null>(null);
+  let pendingTransfers = $state<TransferProgress[]>([]);
 
   const paste = $derived(
     pasteTarget({
@@ -247,6 +272,111 @@
     }
   }
 
+  function paneJob(side: PaneSide): TrackedJob | null {
+    const sessionId = sessionIdFor(panes[side].connectionId);
+    const active = Object.values(jobs);
+    return (
+      active.find(
+        (job) =>
+          job.state === "running" &&
+          (job.toSession === sessionId || job.fromSession === sessionId),
+      ) ??
+      active.find((job) => job.state !== "done" && job.side === side) ??
+      null
+    );
+  }
+
+  function applyTransfer(event: TransferProgress) {
+    const current = jobs[event.id];
+    if (!current) {
+      pendingTransfers = rememberUnmatched(pendingTransfers, event);
+      return;
+    }
+    const reduced = reduceTransfer(current, event);
+    if (reduced.refresh) {
+      const next = { ...jobs };
+      delete next[event.id];
+      jobs = next;
+      reloadToken = {
+        left: reloadToken.left + 1,
+        right: reloadToken.right + 1,
+      };
+      return;
+    }
+    jobs = { ...jobs, [event.id]: { ...current, ...reduced.job } };
+    if (reduced.conflict) {
+      conflict = {
+        side: current.side,
+        message: event.message ?? "That name already exists.",
+        request: { ...current.request, overwrite: true },
+      };
+    }
+  }
+
+  async function startTransfer(side: PaneSide, request: StartRequest) {
+    conflict = null;
+    try {
+      const started = await transferStart({
+        fromSession: request.fromSession,
+        fromPath: request.fromPath,
+        toSession: request.toSession,
+        toPath: request.toPath,
+        overwrite: request.overwrite,
+      });
+      let job: TrackedJob = {
+        id: started.transferId,
+        name: request.name,
+        fromSession: request.fromSession,
+        toSession: request.toSession,
+        toPath: request.toPath,
+        bytes: 0,
+        total: 0,
+        state: "running",
+        message: null,
+        code: null,
+        side,
+        request,
+      };
+      const buffered = takeBuffered(pendingTransfers, started.transferId);
+      pendingTransfers = buffered.rest;
+      let finished = false;
+      for (const event of buffered.matched) {
+        const reduced = reduceTransfer(job, event);
+        job = { ...job, ...reduced.job };
+        if (reduced.conflict) {
+          conflict = {
+            side,
+            message: event.message ?? "That name already exists.",
+            request: { ...request, overwrite: true },
+          };
+        }
+        if (reduced.refresh) {
+          finished = true;
+        }
+      }
+      if (finished) {
+        reloadToken = {
+          left: reloadToken.left + 1,
+          right: reloadToken.right + 1,
+        };
+      } else {
+        jobs = { ...jobs, [started.transferId]: job };
+      }
+    } catch (error) {
+      showError(error);
+    }
+  }
+
+  async function cancelTransfer(id: string) {
+    try {
+      await transferCancel(id);
+    } catch (error) {
+      if (!isAppError(error) || error.code !== "not_found") {
+        showError(error);
+      }
+    }
+  }
+
   onMount(() => {
     const unlisten = listen<HostKeyPrompt>("hostkey://prompt", (event) => {
       const bound = bindHostPrompt(connectingId, event.payload);
@@ -254,11 +384,18 @@
         hostPrompt = bound;
       }
     });
+    const unlistenTransfer = listen<TransferProgress>(
+      "transfer://progress",
+      (event) => {
+        applyTransfer(event.payload);
+      },
+    );
     refresh()
       .then(() => refreshVault())
       .catch(showError);
     return () => {
       void unlisten.then((stop) => stop());
+      void unlistenTransfer.then((stop) => stop());
     };
   });
 
@@ -649,6 +786,32 @@
             }}
             onSessionLost={() => {
               void refresh().catch(showError);
+            }}
+            {marked}
+            onMark={(ref) => {
+              marked = ref;
+            }}
+            onStartTransfer={(request) => {
+              void startTransfer(side, request);
+            }}
+            transferLabel={transferStatusText(paneJob(side))?.text ?? null}
+            transferCanCancel={transferStatusText(paneJob(side))?.canCancel ??
+              false}
+            onCancelTransfer={() => {
+              const job = paneJob(side);
+              if (job) {
+                void cancelTransfer(job.id);
+              }
+            }}
+            reloadToken={reloadToken[side]}
+            askOverwrite={conflict?.side === side ? conflict.message : null}
+            onOverwriteAnyway={() => {
+              if (conflict?.side === side) {
+                void startTransfer(side, conflict.request);
+              }
+            }}
+            onDismissConflict={() => {
+              conflict = null;
             }}
           />
         </div>

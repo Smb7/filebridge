@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client;
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key};
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, StatusCode};
+use russh_sftp::client::fs::File;
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 use super::sftp::SftpGate;
@@ -134,6 +137,7 @@ async fn open_link(
         sftp: tokio::sync::Mutex::new(sftp),
         gate: SftpGate::new(),
         closed: std::sync::atomic::AtomicBool::new(false),
+        opens: Mutex::new(HashMap::new()),
     });
     // Listing "/" fails for chrooted and restricted accounts, so a refused
     // realpath does not fail the connection. A hang still means SFTP is unusable.
@@ -255,6 +259,7 @@ struct RusshLink {
     sftp: tokio::sync::Mutex<SftpSession>,
     gate: SftpGate,
     closed: std::sync::atomic::AtomicBool,
+    opens: Mutex<HashMap<String, File>>,
 }
 
 impl RusshLink {
@@ -375,6 +380,130 @@ impl RusshLink {
             Err(_) => Err(LinkError::InvalidPath),
         }
     }
+
+    async fn open_remote_read(&self, path: &str) -> Result<String, LinkError> {
+        let sftp = &self.sftp;
+        let opens = &self.opens;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let file = {
+                    let session = sftp.lock().await;
+                    session.open(&absolute).await.map_err(map_client_error)?
+                };
+                store_open(opens, file)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn open_remote_write(&self, path: &str) -> Result<String, LinkError> {
+        let sftp = &self.sftp;
+        let opens = &self.opens;
+        match self
+            .gate
+            .run(path, |absolute| async move {
+                let file = {
+                    let session = sftp.lock().await;
+                    session
+                        .open_with_flags(
+                            &absolute,
+                            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
+                        )
+                        .await
+                        .map_err(map_client_error)?
+                };
+                store_open(opens, file)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(LinkError::InvalidPath),
+        }
+    }
+
+    async fn read_remote_open(&self, token: &str, max: u32) -> Result<Vec<u8>, LinkError> {
+        let opens = &self.opens;
+        let token = token.to_string();
+        self.gate
+            .exclusive(|| async move {
+                let mut file = take_open(opens, &token)?;
+                let mut buf = vec![0u8; max.clamp(1, COPY_READ_CAP) as usize];
+                let read = file.read(&mut buf).await;
+                put_open(opens, token, file);
+                let n = read.map_err(map_io)?;
+                buf.truncate(n);
+                Ok(buf)
+            })
+            .await
+    }
+
+    async fn write_remote_open(&self, token: &str, data: &[u8]) -> Result<(), LinkError> {
+        let opens = &self.opens;
+        let token = token.to_string();
+        let data = data.to_vec();
+        self.gate
+            .exclusive(|| async move {
+                let mut file = take_open(opens, &token)?;
+                let write = file.write_all(&data).await;
+                put_open(opens, token, file);
+                write.map_err(map_io)
+            })
+            .await
+    }
+
+    async fn close_remote_open(&self, token: &str) -> Result<(), LinkError> {
+        let opens = &self.opens;
+        let token = token.to_string();
+        self.gate
+            .exclusive(|| async move {
+                let Some(file) = opens.lock().map_err(|_| LinkError::Failed)?.remove(&token) else {
+                    return Ok(());
+                };
+                file.close().await.map_err(map_io)
+            })
+            .await
+    }
+}
+
+const COPY_READ_CAP: u32 = 32 * 1024;
+
+fn store_open(opens: &Mutex<HashMap<String, File>>, file: File) -> Result<String, LinkError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    opens
+        .lock()
+        .map_err(|_| LinkError::Failed)?
+        .insert(token.clone(), file);
+    Ok(token)
+}
+
+fn take_open(opens: &Mutex<HashMap<String, File>>, token: &str) -> Result<File, LinkError> {
+    opens
+        .lock()
+        .map_err(|_| LinkError::Failed)?
+        .remove(token)
+        .ok_or(LinkError::Failed)
+}
+
+fn put_open(opens: &Mutex<HashMap<String, File>>, token: String, file: File) {
+    if let Ok(mut opens) = opens.lock() {
+        opens.insert(token, file);
+    }
+}
+
+fn map_io(error: std::io::Error) -> LinkError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => LinkError::NotFound,
+        std::io::ErrorKind::PermissionDenied => LinkError::PermissionDenied,
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::UnexpectedEof => LinkError::NotConnected,
+        _ => LinkError::Failed,
+    }
 }
 
 impl RemoteFs for RusshLink {
@@ -434,6 +563,48 @@ impl RemoteFs for RusshLink {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
     {
         Box::pin(self.remove_remote_dir(path))
+    }
+
+    fn open_read<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.open_remote_read(path))
+    }
+
+    fn read_open<'a>(
+        &'a self,
+        token: &'a str,
+        max: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.read_remote_open(token, max))
+    }
+
+    fn open_write<'a>(
+        &'a self,
+        path: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.open_remote_write(path))
+    }
+
+    fn write_open<'a>(
+        &'a self,
+        token: &'a str,
+        data: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.write_remote_open(token, data))
+    }
+
+    fn close_open<'a>(
+        &'a self,
+        token: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), LinkError>> + Send + 'a>>
+    {
+        Box::pin(self.close_remote_open(token))
     }
 }
 
