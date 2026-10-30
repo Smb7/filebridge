@@ -12,6 +12,7 @@ import {
   planSave,
   quitChoice,
   sameFile,
+  settleSave,
 } from "./editor";
 
 const baseline = "ab".repeat(32);
@@ -165,5 +166,21 @@ describe("editor windows", () => {
     expect(closeChoice(false)).toBe("close");
     expect(quitChoice(1)).toBe("prompt");
     expect(quitChoice(0)).toBe("quit");
+  });
+
+  it("does not report a clean buffer when text arrived during the save", () => {
+    const loaded = 'interval = "10s"\n';
+    const typed = `${loaded}flush_interval = "5s"\n`;
+    expect(settleSave(loaded, loaded)).toEqual({
+      lastSaved: loaded,
+      dirty: false,
+    });
+    expect(settleSave(loaded, typed)).toEqual({
+      lastSaved: loaded,
+      dirty: true,
+    });
+    // A save that finished before the last keystroke must not let the close
+    // prompt dismiss the window as saved.
+    expect(closeChoice(settleSave(loaded, typed).dirty)).toBe("prompt");
   });
 });

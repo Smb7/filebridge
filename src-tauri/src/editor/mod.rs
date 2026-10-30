@@ -480,24 +480,36 @@ pub fn prompt_quit(app: &AppHandle) {
     let Some(prompt) = editors.begin_quit_prompt() else {
         return;
     };
+    if prompt_quit_in(app, &prompt) {
+        return;
+    }
+    // No window could show the prompt. Drop the marker so the next close
+    // attempt can ask again instead of refusing to quit in silence.
+    editors.clear_quit_prompt();
+}
+
+fn prompt_quit_in(app: &AppHandle, prompt: &QuitPrompt) -> bool {
     if let Some(main) = app.get_webview_window("main") {
-        let _ = main.emit(CONFIRM_QUIT, &prompt);
+        let _ = main.emit(CONFIRM_QUIT, prompt);
         let _ = main.unminimize();
         let _ = main.show();
         let _ = main.set_focus();
-        return;
+        return true;
     }
+    let Some(editors) = app.try_state::<EditorState>() else {
+        return false;
+    };
     let label = editors
         .inner
         .lock()
         .ok()
         .and_then(|data| data.order.first().cloned());
-    if let Some(label) = label
-        && let Some(window) = app.get_webview_window(&label)
-    {
-        let _ = window.emit(CONFIRM_QUIT, &prompt);
-        let _ = window.set_focus();
-    }
+    let Some(window) = label.and_then(|label| app.get_webview_window(&label)) else {
+        return false;
+    };
+    let _ = window.emit(CONFIRM_QUIT, prompt);
+    let _ = window.set_focus();
+    true
 }
 
 #[tauri::command]

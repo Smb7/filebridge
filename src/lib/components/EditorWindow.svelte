@@ -29,6 +29,7 @@
     planRemoteWrite,
     planSave,
     sameFile,
+    settleSave,
     type EditorPeer,
   } from "$lib/editor";
 
@@ -192,6 +193,20 @@
     await emit("editor://request-peer", { editorId });
   }
 
+  async function noteSavedState(
+    writtenSha256: string,
+    written: string,
+  ): Promise<boolean> {
+    baseline = writtenSha256;
+    pinnedDirty = false;
+    const current = contentOf();
+    const settled = settleSave(written, current);
+    lastSaved = settled.lastSaved;
+    dirty = settled.dirty;
+    await editorDraft(current, dirty);
+    return settled.dirty;
+  }
+
   async function save(force = false): Promise<boolean> {
     if (busy) {
       return false;
@@ -224,14 +239,12 @@
       const noted = await editorNoteSaved(written.sha256, plan.path);
       if (noted.retargeted) {
         path = noted.path;
-        baseline = written.sha256;
-        lastSaved = content;
-        pinnedDirty = false;
-        dirty = false;
-        await editorDraft(content, false);
-        status = "Saved.";
+        const stillDirty = await noteSavedState(written.sha256, content);
+        status = stillDirty
+          ? "Saved. Edits typed during the save are not saved yet."
+          : "Saved.";
         askConflict = false;
-        return true;
+        return !stillDirty;
       }
       status = "Saved. This window stays on the original file.";
       return false;
@@ -267,22 +280,21 @@
     status = "Saving…";
     try {
       await flushDraft();
-      const written = await fsWrite(targetSession, targetPath, contentOf(), {
+      const content = contentOf();
+      const written = await fsWrite(targetSession, targetPath, content, {
         overwrite,
       });
       if (retarget) {
         const noted = await editorNoteSaved(written.sha256, targetPath);
         if (noted.retargeted) {
           path = noted.path;
-          baseline = written.sha256;
-          lastSaved = contentOf();
-          pinnedDirty = false;
-          dirty = false;
-          await editorDraft(lastSaved, false);
+          const stillDirty = await noteSavedState(written.sha256, content);
+          status = stillDirty
+            ? "Saved. Edits typed during the save are not saved yet."
+            : "Saved.";
+        } else {
+          status = "Saved. This window stays on the original file.";
         }
-        status = noted.retargeted
-          ? "Saved."
-          : "Saved. This window stays on the original file.";
       } else {
         status = "Saved to the other pane.";
       }
@@ -355,8 +367,8 @@
   }
 
   async function saveAndClose() {
-    const saved = await save(false);
-    if (saved) {
+    const clean = await save(false);
+    if (clean) {
       await discard();
     }
   }

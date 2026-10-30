@@ -141,6 +141,18 @@ export function otherSaveLabel(name: string | null | undefined): string {
   return `Save to ${name}`;
 }
 
+/**
+ * A save writes the snapshot taken before the request. Text typed while the
+ * write was in flight is still unsaved, so the window must not report itself
+ * clean or close itself as if it were.
+ */
+export function settleSave(
+  written: string,
+  current: string,
+): { lastSaved: string; dirty: boolean } {
+  return { lastSaved: written, dirty: current !== written };
+}
+
 export function closeChoice(dirty: boolean): "prompt" | "close" {
   return dirty ? "prompt" : "close";
 }

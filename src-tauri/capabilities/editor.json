@@ -3,5 +3,5 @@
   "identifier": "editor",
   "description": "Editor windows. No shell, filesystem, or remote URL permissions.",
   "windows": ["editor-*"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "core:window:allow-destroy"]
 }
