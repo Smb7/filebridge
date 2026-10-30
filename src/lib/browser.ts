@@ -183,6 +183,28 @@ export function clearBrowser(state: BrowserState): BrowserState {
   return attachSession(state, "/");
 }
 
+/** Drop a live listing without forgetting the pane directory. */
+export function releaseSession(
+  state: BrowserState,
+  path: string,
+): BrowserState {
+  const kept = path.startsWith("/")
+    ? path
+    : state.path.startsWith("/")
+      ? state.path
+      : "/";
+  return {
+    path: kept,
+    draft: null,
+    entries: [],
+    selectedName: null,
+    generation: state.generation + 1,
+    listing: false,
+    error: null,
+    pathError: null,
+  };
+}
+
 export function beginListing(state: BrowserState): {
   state: BrowserState;
   generation: number;

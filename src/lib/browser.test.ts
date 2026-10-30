@@ -19,6 +19,7 @@ import {
   pathFieldEnabled,
   pathPointer,
   rejectListing,
+  releaseSession,
   scrollForIndex,
   serverLabel,
   startingPath,
@@ -182,6 +183,24 @@ describe("stale listings", () => {
     expect(next.path).toBe("/var");
     expect(next.entries).toEqual([]);
     expect(next.generation).toBe(5);
+  });
+
+  it("keeps the pane directory when the session drops", () => {
+    const state = {
+      ...createBrowser("/var/log"),
+      entries: [entry("syslog")],
+      generation: 3,
+      listing: true,
+    };
+    const released = releaseSession(state, "/var/log");
+    expect(released.path).toBe("/var/log");
+    expect(released.entries).toEqual([]);
+    expect(released.listing).toBe(false);
+    expect(released.generation).toBe(4);
+    expect(acceptListing(released, 3, "/", [entry("lost.conf")])).toBe(
+      released,
+    );
+    expect(releaseSession(state, "relative").path).toBe("/var/log");
   });
 });
 

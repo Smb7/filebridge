@@ -624,6 +624,7 @@
             focusToken={focusToken[side]}
             {connections}
             connection={connectionFor(panes[side].connectionId)}
+            directory={panes[side].directory}
             session={sessionFor(panes[side].connectionId)}
             connecting={connectingId !== null &&
               connectingId === panes[side].connectionId}

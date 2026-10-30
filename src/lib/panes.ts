@@ -1,4 +1,4 @@
-import { serverLabel } from "./browser";
+import { serverLabel, startingPath } from "./browser";
 
 /**
  * Pane bindings are UI state. The backend does not know left from right.
@@ -139,6 +139,20 @@ export function paneHeader(
     endpoint: serverLabel(connection),
     focused,
   };
+}
+
+/**
+ * A remembered absolute directory wins over the connection default.
+ * Session loss must not substitute the other pane's path or "/".
+ */
+export function paneListPath(
+  directory: string,
+  defaultPath: string | null | undefined,
+): string {
+  if (directory.startsWith("/")) {
+    return directory;
+  }
+  return startingPath(defaultPath);
 }
 
 /** List paste belongs to the focused pane's current directory, not the other one. */
