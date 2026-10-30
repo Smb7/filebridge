@@ -36,6 +36,20 @@
     type TrustedHost,
     type VaultMode,
   } from "$lib/api";
+  import { startingPath } from "$lib/browser";
+  import {
+    PANE_SIDES,
+    assignConnection,
+    clearConnection,
+    createDualPane,
+    dropMissingConnections,
+    focusPane,
+    otherSide,
+    paneLabel,
+    pasteTarget,
+    setDirectory,
+    type PaneSide,
+  } from "$lib/panes";
 
   const methods: { value: AuthMethod; label: string }[] = [
     { value: "password", label: "Password" },
@@ -69,13 +83,86 @@
   let hostPrompt = $state<BoundHostPrompt | null>(null);
   let sessions = $state<LiveSession[]>([]);
   let connectingId = $state<string | null>(null);
+  let panes = $state(createDualPane());
+  let focusToken = $state({ left: 0, right: 0 });
 
-  const selected = $derived(
-    connections.find((connection) => connection.id === selectedId) ?? null,
+  const paste = $derived(
+    pasteTarget({
+      focused: panes.focused,
+      left: {
+        connectionId: panes.left.connectionId,
+        directory: panes.left.directory,
+        sessionId: sessionIdFor(panes.left.connectionId),
+      },
+      right: {
+        connectionId: panes.right.connectionId,
+        directory: panes.right.directory,
+        sessionId: sessionIdFor(panes.right.connectionId),
+      },
+    }),
   );
-  const selectedSession = $derived(
-    selectedId ? (sessionForConnection(sessions, selectedId) ?? null) : null,
-  );
+
+  function sessionIdFor(id: string | null): string | null {
+    if (!id) {
+      return null;
+    }
+    return sessionForConnection(sessions, id)?.sessionId ?? null;
+  }
+
+  function connectionFor(id: string | null): Connection | null {
+    if (!id) {
+      return null;
+    }
+    return connections.find((connection) => connection.id === id) ?? null;
+  }
+
+  function sessionFor(id: string | null): LiveSession | null {
+    if (!id) {
+      return null;
+    }
+    return sessionForConnection(sessions, id) ?? null;
+  }
+
+  function activate(side: PaneSide) {
+    panes = focusPane(panes, side);
+  }
+
+  function focusOther(side: PaneSide) {
+    const next = otherSide(side);
+    panes = focusPane(panes, next);
+    focusToken = { ...focusToken, [next]: focusToken[next] + 1 };
+  }
+
+  function rememberDirectory(side: PaneSide, path: string) {
+    const next = setDirectory(panes, side, path);
+    if (next !== panes) {
+      panes = next;
+    }
+  }
+
+  function choosePane(side: PaneSide, id: string) {
+    const connection = connections.find((item) => item.id === id);
+    if (!connection) {
+      return;
+    }
+    panes = assignConnection(
+      focusPane(panes, side),
+      side,
+      connection.id,
+      startingPath(connection.defaultPath),
+    );
+    fill(connection);
+  }
+
+  function chooseFocused(connection: Connection) {
+    panes = assignConnection(
+      panes,
+      panes.focused,
+      connection.id,
+      startingPath(connection.defaultPath),
+    );
+    fill(connection);
+  }
 
   function fill(connection: Connection) {
     selectedId = connection.id;
@@ -106,7 +193,7 @@
     }
   }
 
-  function clearForm() {
+  function resetForm() {
     selectedId = null;
     name = "";
     host = "";
@@ -127,6 +214,16 @@
     connections = await connectionsList();
     trustedHosts = await hostkeyList();
     sessions = await sessionList();
+    panes = dropMissingConnections(
+      panes,
+      connections.map((connection) => connection.id),
+    );
+    if (
+      selectedId &&
+      !connections.some((connection) => connection.id === selectedId)
+    ) {
+      resetForm();
+    }
   }
 
   function showError(error: unknown) {
@@ -201,11 +298,10 @@
     connectingId = null;
   }
 
-  async function connectSelected() {
-    if (!selectedId || connectingId || hostPrompt) {
+  async function connectConnection(connectionId: string) {
+    if (!connectionId || connectingId || hostPrompt) {
       return;
     }
-    const connectionId = selectedId;
     errorMessage = "";
     connectingId = connectionId;
     try {
@@ -228,11 +324,8 @@
     }
   }
 
-  async function disconnectSelected() {
-    if (!selectedId) {
-      return;
-    }
-    const live = sessionForConnection(sessions, selectedId);
+  async function disconnectConnection(connectionId: string) {
+    const live = sessionForConnection(sessions, connectionId);
     if (!live) {
       return;
     }
@@ -323,6 +416,7 @@
         errorMessage = plan.message;
         return;
       }
+      const creating = selectedId === null;
       const saved = await connectionsSave({
         id: selectedId ?? undefined,
         name,
@@ -350,6 +444,14 @@
       privateKeyPem = "";
       passphrase = "";
       fill(saved);
+      if (creating && panes[panes.focused].connectionId === null) {
+        panes = assignConnection(
+          panes,
+          panes.focused,
+          saved.id,
+          startingPath(saved.defaultPath),
+        );
+      }
     } catch (error) {
       showError(error);
     } finally {
@@ -384,11 +486,13 @@
     if (!confirm(`Delete ${label}? This does not change the server.`)) {
       return;
     }
+    const id = selectedId;
     errorMessage = "";
     busy = true;
     try {
-      await connectionsDelete(selectedId);
-      clearForm();
+      await connectionsDelete(id);
+      panes = clearConnection(panes, id);
+      resetForm();
       await refresh();
     } catch (error) {
       showError(error);
@@ -402,7 +506,7 @@
   <section class="list" aria-label="Saved connections">
     <header>
       <h1>FileBridge</h1>
-      <button type="button" onclick={clearForm}>New</button>
+      <button type="button" onclick={resetForm}>New</button>
     </header>
     {#if connections.length === 0}
       <p class="empty">No saved connections.</p>
@@ -413,7 +517,7 @@
             <button
               type="button"
               class:selected={connection.id === selectedId}
-              onclick={() => fill(connection)}
+              onclick={() => chooseFocused(connection)}
             >
               <span>{connection.name}</span>
               <small>
@@ -506,25 +610,48 @@
         </button>
       </form>
     {/if}
-    <div class="pane-slot">
-      <FilePane
-        {connections}
-        connection={selected}
-        session={selectedSession}
-        connecting={connectingId !== null && connectingId === selectedId}
-        connectDisabled={busy || connectingId !== null || hostPrompt !== null}
-        onSelect={(id) => {
-          const connection = connections.find((item) => item.id === id);
-          if (connection) {
-            fill(connection);
-          }
-        }}
-        onConnect={connectSelected}
-        onDisconnect={disconnectSelected}
-        onSessionLost={() => {
-          void refresh().catch(showError);
-        }}
-      />
+    <div
+      class="panes"
+      data-focused={panes.focused}
+      data-paste-path={paste?.path ?? ""}
+      data-paste-session={paste?.sessionId ?? ""}
+    >
+      {#each PANE_SIDES as side (side)}
+        <div class="pane-slot">
+          <FilePane
+            label={paneLabel(side)}
+            focused={panes.focused === side}
+            focusToken={focusToken[side]}
+            {connections}
+            connection={connectionFor(panes[side].connectionId)}
+            session={sessionFor(panes[side].connectionId)}
+            connecting={connectingId !== null &&
+              connectingId === panes[side].connectionId}
+            connectDisabled={busy ||
+              connectingId !== null ||
+              hostPrompt !== null}
+            onActivate={() => activate(side)}
+            onFocusOther={() => focusOther(side)}
+            onDirectory={(path) => rememberDirectory(side, path)}
+            onSelect={(id) => choosePane(side, id)}
+            onConnect={() => {
+              const id = panes[side].connectionId;
+              if (id) {
+                void connectConnection(id);
+              }
+            }}
+            onDisconnect={() => {
+              const id = panes[side].connectionId;
+              if (id) {
+                void disconnectConnection(id);
+              }
+            }}
+            onSessionLost={() => {
+              void refresh().catch(showError);
+            }}
+          />
+        </div>
+      {/each}
     </div>
     <details class="settings" open>
       <summary>Connection settings</summary>
@@ -659,14 +786,24 @@
             <button
               type="button"
               disabled={busy || connectingId !== null || hostPrompt !== null}
-              onclick={connectSelected}
+              onclick={() => {
+                if (selectedId) {
+                  void connectConnection(selectedId);
+                }
+              }}
             >
               {connectingId === selectedId ? "Connecting…" : "Connect"}
             </button>
           {/if}
           {#if selectedId && sessionForConnection(sessions, selectedId)}
-            <button type="button" disabled={busy} onclick={disconnectSelected}
-              >Disconnect</button
+            <button
+              type="button"
+              disabled={busy}
+              onclick={() => {
+                if (selectedId) {
+                  void disconnectConnection(selectedId);
+                }
+              }}>Disconnect</button
             >
           {/if}
           {#if selectedId && hasCredential && !locked}
@@ -721,12 +858,23 @@
     flex-direction: column;
   }
 
-  .pane-slot {
+  .panes {
     flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .pane-slot {
+    min-width: 0;
     min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+  }
+
+  .pane-slot + .pane-slot {
+    border-left: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
   }
 
   .settings {
@@ -874,8 +1022,15 @@
       min-height: 100vh;
     }
 
-    .pane-slot {
-      min-height: 24rem;
+    .panes {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(16rem, 1fr) minmax(16rem, 1fr);
+      min-height: 36rem;
+    }
+
+    .pane-slot + .pane-slot {
+      border-left: 0;
+      border-top: 1px solid color-mix(in srgb, CanvasText 18%, transparent);
     }
 
     .list {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import {
     fsList,
     fsStat,
@@ -27,18 +27,24 @@
     pathPointer,
     rejectListing,
     scrollForIndex,
-    serverLabel,
     startingPath,
     visibleRange,
     type DirEntry,
   } from "$lib/browser";
+  import { paneHeader } from "$lib/panes";
 
   type Props = {
+    label: string;
+    focused: boolean;
+    focusToken: number;
     connections: Connection[];
     connection: Connection | null;
     session: LiveSession | null;
     connecting: boolean;
     connectDisabled: boolean;
+    onActivate: () => void;
+    onFocusOther: () => void;
+    onDirectory: (path: string) => void;
     onSelect: (id: string) => void;
     onConnect: () => void;
     onDisconnect: () => void;
@@ -46,11 +52,17 @@
   };
 
   let {
+    label,
+    focused,
+    focusToken,
     connections,
     connection,
     session,
     connecting,
     connectDisabled,
+    onActivate,
+    onFocusOther,
+    onDirectory,
     onSelect,
     onConnect,
     onDisconnect,
@@ -64,8 +76,10 @@
   let viewportHeight = $state(320);
   let pathInput = $state<HTMLInputElement | null>(null);
   let viewport = $state<HTMLDivElement | null>(null);
+  let paneRoot = $state<HTMLElement | null>(null);
+  let appliedFocus = 0;
 
-  const endpoint = $derived(connection ? serverLabel(connection) : "");
+  const header = $derived(paneHeader(connection, focused));
   const pathValue = $derived(browser.draft ?? browser.path);
   const range = $derived(
     visibleRange({
@@ -226,8 +240,12 @@
       meta: event.metaKey,
       shift: event.shiftKey,
     });
-    // One pane in this branch. Tab stays a normal focus move; dual-pane will consume it.
-    if (action.type === "ignore" || action.type === "focus-other") {
+    if (action.type === "focus-other") {
+      event.preventDefault();
+      onFocusOther();
+      return;
+    }
+    if (action.type === "ignore") {
       return;
     }
     event.preventDefault();
@@ -286,6 +304,25 @@
     void load(id, start);
   });
 
+  $effect(() => {
+    onDirectory(browser.path);
+  });
+
+  $effect(() => {
+    const token = focusToken;
+    if (token === 0 || token === appliedFocus) {
+      return;
+    }
+    appliedFocus = token;
+    void tick().then(() => {
+      if (viewport && pathFieldEnabled(session?.sessionId)) {
+        viewport.focus();
+        return;
+      }
+      paneRoot?.focus();
+    });
+  });
+
   onMount(() => {
     measure();
     const observer = new ResizeObserver(() => measure());
@@ -296,11 +333,20 @@
   });
 </script>
 
-<section class="pane" aria-label="Remote files">
+<section
+  class="pane"
+  class:focused
+  aria-label={focused ? `${label}, focused` : label}
+  data-focused={focused ? "true" : "false"}
+  tabindex="-1"
+  bind:this={paneRoot}
+  onpointerdown={() => onActivate()}
+  onfocusin={() => onActivate()}
+>
   <header>
     <div class="identity">
-      <h2>{connection?.name ?? "No server"}</h2>
-      <p>{endpoint || "Choose a server"}</p>
+      <h2>{header.title}</h2>
+      <p>{header.endpoint}</p>
     </div>
     <div class="controls">
       <label>
@@ -402,7 +448,7 @@
   </div>
   <p class="status" id="list-keys">
     {status}
-    <span class="keys">Up/Down, Enter, Backspace, F5</span>
+    <span class="keys">Up/Down, Enter, Backspace, F5, Tab</span>
   </p>
 </section>
 
@@ -411,10 +457,20 @@
     display: flex;
     flex: 1;
     flex-direction: column;
+    height: 100%;
+    min-width: 0;
     min-height: 0;
     overflow: hidden;
     padding: 0.85rem 1rem 0.6rem;
     gap: 0.55rem;
+    outline: 2px solid transparent;
+    outline-offset: -2px;
+  }
+
+  .pane.focused {
+    outline-color: AccentColor;
+    box-shadow: inset 3px 0 0 AccentColor;
+    background: color-mix(in srgb, AccentColor 7%, Canvas);
   }
 
   header,
@@ -426,8 +482,9 @@
   }
 
   header {
-    align-items: flex-end;
-    justify-content: space-between;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.45rem;
   }
 
   .identity {
@@ -459,7 +516,11 @@
 
   .controls,
   .path {
-    align-items: center;
+    align-items: flex-end;
+  }
+
+  .controls label {
+    flex: 1;
   }
 
   .path,
