@@ -36,6 +36,8 @@ pub struct SessionStarted {
 pub struct CommandError {
     pub code: &'static str,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<Box<HostKeyPrompt>>,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,7 @@ enum SessionError {
     Unsupported,
     SftpUnavailable,
     InvalidHostKey,
+    AlreadyTrusted,
     Database,
 }
 
@@ -61,34 +64,62 @@ impl From<DbError> for SessionError {
 
 impl From<SessionError> for CommandError {
     fn from(error: SessionError) -> Self {
-        let (code, message) = match error {
-            SessionError::VaultLocked => ("vault_locked", "Unlock the vault first.".to_string()),
-            SessionError::HostKey(prompt) => host_key_message(&prompt),
-            SessionError::AuthFailed => ("auth_failed", "Authentication failed.".to_string()),
-            SessionError::Unreachable => ("unreachable", "Could not reach the server.".to_string()),
-            SessionError::NotFound => ("not_found", "Connection not found.".to_string()),
-            SessionError::NothingToTrust => {
-                ("not_found", "No host key is waiting for trust.".to_string())
+        let (code, message, prompt) = match error {
+            SessionError::VaultLocked => {
+                ("vault_locked", "Unlock the vault first.".to_string(), None)
             }
+            SessionError::HostKey(prompt) => {
+                let (code, message) = host_key_message(&prompt);
+                (code, message, Some(prompt))
+            }
+            SessionError::AuthFailed => ("auth_failed", "Authentication failed.".to_string(), None),
+            SessionError::Unreachable => (
+                "unreachable",
+                "Could not reach the server.".to_string(),
+                None,
+            ),
+            SessionError::NotFound => ("not_found", "Connection not found.".to_string(), None),
+            SessionError::NothingToTrust => (
+                "not_found",
+                "No host key is waiting for trust.".to_string(),
+                None,
+            ),
             SessionError::UnsupportedAuth => (
                 "auth_failed",
                 "SSH agent authentication is not available yet.".to_string(),
+                None,
             ),
             SessionError::Unsupported => (
                 "unsupported",
                 "SSH certificates are not supported.".to_string(),
+                None,
             ),
             SessionError::SftpUnavailable => (
                 "sftp_unavailable",
                 "The server did not open SFTP.".to_string(),
+                None,
             ),
             SessionError::InvalidHostKey => (
                 "invalid_host_key",
                 "The fingerprint does not match the presented host key.".to_string(),
+                None,
             ),
-            SessionError::Database => ("database", "Could not update the session.".to_string()),
+            SessionError::AlreadyTrusted => (
+                "try_again",
+                "The host key is already trusted. Connect again.".to_string(),
+                None,
+            ),
+            SessionError::Database => (
+                "database",
+                "Could not update the session.".to_string(),
+                None,
+            ),
         };
-        Self { code, message }
+        Self {
+            code,
+            message,
+            prompt,
+        }
     }
 }
 
@@ -113,6 +144,15 @@ fn host_key_message(prompt: &HostKeyPrompt) -> (&'static str, String) {
 
 pub(crate) fn accept_server_key(decision: HostKeyDecision) -> bool {
     decision == HostKeyDecision::Trusted
+}
+
+pub(crate) fn same_endpoint(
+    summary: &SessionSummary,
+    host: &str,
+    port: u16,
+    username: &str,
+) -> bool {
+    summary.port == port && summary.username == username && summary.host.eq_ignore_ascii_case(host)
 }
 
 pub(crate) fn matches_trusted_key(
@@ -265,11 +305,14 @@ impl SessionRegistry {
     ) -> Result<SessionStarted, SessionError> {
         let lock = self.connection_lock(connection_id)?;
         let _guard = lock.lock().await;
-        if let Some(existing) = self.reusable(connection_id)? {
+        let saved = self.load_saved(database, connection_id)?;
+        if let Some(existing) = self.reusable(&saved)? {
             return Ok(existing);
         }
+        // A closed session, or one whose host, port, or user changed, must not
+        // be returned. Close it before dialing so the old server is not left open.
+        self.close_live(connection_id).await?;
 
-        let saved = self.load_saved(database, connection_id)?;
         let auth = prepare_saved(database, vault, &saved)?;
         let known_keys = database.with_connection(|connection| {
             known_hosts::stored_keys(connection, &saved.host, saved.port)
@@ -296,13 +339,15 @@ impl SessionRegistry {
         }
     }
 
-    fn trust_host(
+    async fn trust_host(
         &self,
         database: &Database,
         hosts: &HostKeyState,
         connection_id: &str,
         fingerprint: &str,
     ) -> Result<(), SessionError> {
+        let lock = self.connection_lock(connection_id)?;
+        let _guard = lock.lock().await;
         let pending_id = self
             .pending_for(connection_id)?
             .ok_or(SessionError::NothingToTrust)?;
@@ -311,7 +356,21 @@ impl SessionRegistry {
                 .confirm_fingerprint(connection, &pending_id, fingerprint)
                 .map_err(trust_error)
         })?;
-        self.clear_pending(connection_id)
+        self.clear_pending_if(connection_id, &pending_id)
+    }
+
+    async fn delete_connection(
+        &self,
+        database: &Database,
+        connection_id: &str,
+    ) -> Result<(), SessionError> {
+        let lock = self.connection_lock(connection_id)?;
+        let _guard = lock.lock().await;
+        self.close_live(connection_id).await?;
+        self.clear_pending(connection_id)?;
+        database.with_connection(|connection| {
+            connections::remove(connection, connection_id).map_err(remove_error)
+        })
     }
 
     async fn disconnect(&self, session_id: &str) -> Result<(), SessionError> {
@@ -353,13 +412,17 @@ impl SessionRegistry {
         Ok(sessions)
     }
 
-    fn reusable(&self, connection_id: &str) -> Result<Option<SessionStarted>, SessionError> {
-        let Some(existing) = self.live(connection_id)? else {
+    fn reusable(&self, saved: &SavedConnection) -> Result<Option<SessionStarted>, SessionError> {
+        let Some(existing) = self.live(&saved.id)? else {
             return Ok(None);
         };
-        if existing.link.is_closed() {
-            self.remove_connection(connection_id)?;
+        if existing.link.is_closed()
+            || !same_endpoint(&existing.summary, &saved.host, saved.port, &saved.username)
+        {
             return Ok(None);
+        }
+        if existing.summary.name != saved.name {
+            self.rename(&saved.id, &saved.name)?;
         }
         Ok(Some(SessionStarted {
             session_id: existing.summary.session_id.clone(),
@@ -380,7 +443,7 @@ impl SessionRegistry {
                 .map_err(present_error)
         })?;
         if prompt.decision == HostKeyDecision::Trusted {
-            return Err(SessionError::Unreachable);
+            return Err(SessionError::AlreadyTrusted);
         }
         self.remember_pending(&saved.id, &prompt.pending_id)?;
         Err(SessionError::HostKey(Box::new(prompt)))
@@ -431,12 +494,41 @@ impl SessionRegistry {
         Ok(data.by_connection.get(connection_id).cloned())
     }
 
-    fn remove_connection(&self, connection_id: &str) -> Result<(), SessionError> {
+    fn rename(&self, connection_id: &str, name: &str) -> Result<(), SessionError> {
         let mut data = self.data.lock().map_err(|_| SessionError::Database)?;
-        if let Some(live) = data.by_connection.remove(connection_id) {
-            data.by_session.remove(&live.summary.session_id);
-        }
+        let Some(live) = data.by_connection.get(connection_id).cloned() else {
+            return Ok(());
+        };
+        let mut summary = live.summary.clone();
+        summary.name = name.to_string();
+        data.by_connection.insert(
+            connection_id.to_string(),
+            Arc::new(LiveSession {
+                summary,
+                link: live.link.clone(),
+            }),
+        );
         Ok(())
+    }
+
+    async fn close_live(&self, connection_id: &str) -> Result<(), SessionError> {
+        let Some(live) = self.take_connection(connection_id)? else {
+            return Ok(());
+        };
+        live.link.close().await;
+        Ok(())
+    }
+
+    fn take_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<Option<Arc<LiveSession>>, SessionError> {
+        let mut data = self.data.lock().map_err(|_| SessionError::Database)?;
+        let Some(live) = data.by_connection.remove(connection_id) else {
+            return Ok(None);
+        };
+        data.by_session.remove(&live.summary.session_id);
+        Ok(Some(live))
     }
 
     fn remember_pending(&self, connection_id: &str, pending_id: &str) -> Result<(), SessionError> {
@@ -454,6 +546,18 @@ impl SessionRegistry {
     fn clear_pending(&self, connection_id: &str) -> Result<(), SessionError> {
         let mut data = self.data.lock().map_err(|_| SessionError::Database)?;
         data.pending.remove(connection_id);
+        Ok(())
+    }
+
+    fn clear_pending_if(&self, connection_id: &str, pending_id: &str) -> Result<(), SessionError> {
+        let mut data = self.data.lock().map_err(|_| SessionError::Database)?;
+        if data
+            .pending
+            .get(connection_id)
+            .is_some_and(|current| current == pending_id)
+        {
+            data.pending.remove(connection_id);
+        }
         Ok(())
     }
 
@@ -501,6 +605,13 @@ fn needs_vault(method: AuthMethod, has_secret: bool) -> bool {
         AuthMethod::Password | AuthMethod::PrivateKey => true,
         AuthMethod::KeyFile => has_secret,
         AuthMethod::Agent => false,
+    }
+}
+
+fn remove_error(error: connections::RemoveError) -> SessionError {
+    match error {
+        connections::RemoveError::NotFound => SessionError::NotFound,
+        connections::RemoveError::Database => SessionError::Database,
     }
 }
 
@@ -555,6 +666,23 @@ impl SessionState {
             .connect(&self.dialer, database, vault, hosts, connection_id)
             .await
     }
+
+    pub async fn delete_connection(
+        &self,
+        database: &Database,
+        connection_id: &str,
+    ) -> Result<(), crate::connections::CommandError> {
+        self.registry
+            .delete_connection(database, connection_id)
+            .await
+            .map_err(|error| {
+                let command = CommandError::from(error);
+                crate::connections::CommandError {
+                    code: command.code,
+                    message: command.message,
+                }
+            })
+    }
 }
 
 impl Default for SessionState {
@@ -586,7 +714,7 @@ pub async fn session_connect(
 }
 
 #[tauri::command]
-pub fn session_trust_host(
+pub async fn session_trust_host(
     database: tauri::State<'_, Database>,
     hosts: tauri::State<'_, HostKeyState>,
     sessions: tauri::State<'_, SessionState>,
@@ -596,6 +724,7 @@ pub fn session_trust_host(
     sessions
         .registry
         .trust_host(&database, &hosts, &connection_id, &fingerprint)
+        .await
         .map_err(CommandError::from)
 }
 
@@ -622,7 +751,7 @@ pub fn session_list(
 mod tests {
     use super::{
         CommandError, DialError, DialTarget, Dialer, RemoteLink, SessionError, SessionRegistry,
-        accept_server_key, matches_trusted_key, prepare_auth,
+        SessionSummary, accept_server_key, matches_trusted_key, prepare_auth, same_endpoint,
     };
     use crate::connections::AuthMethod;
     use crate::db::apply_migrations;
@@ -863,6 +992,166 @@ mod tests {
         assert!(used.is_some());
     }
 
+    #[test]
+    fn endpoint_match_ignores_host_case_only() {
+        let summary = SessionSummary {
+            session_id: "ses".to_string(),
+            connection_id: "conn-1".to_string(),
+            name: "prod-telegraf".to_string(),
+            username: "ubuntu".to_string(),
+            host: "Example.COM".to_string(),
+            port: 22,
+        };
+        assert!(same_endpoint(&summary, "example.com", 22, "ubuntu"));
+        assert!(!same_endpoint(&summary, "other.example", 22, "ubuntu"));
+        assert!(!same_endpoint(&summary, "example.com", 2222, "ubuntu"));
+        assert!(!same_endpoint(&summary, "example.com", 22, "root"));
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_is_not_reused_and_the_old_link_is_closed() {
+        let fixture = fixture("password", None);
+        save_password(&fixture, "hunter2-secret");
+        let dialer = ScriptedDialer::new(vec![Script::Connected, Script::Connected]);
+        let first = fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("first");
+        let first_closed = dialer
+            .last_closed
+            .lock()
+            .expect("closed")
+            .clone()
+            .expect("link");
+        fixture
+            .database
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE connections SET host = 'other.example', name = 'renamed' WHERE id = ?1",
+                        [&fixture.connection_id],
+                    )
+                    .map_err(|_| SessionError::Database)?;
+                Ok::<(), SessionError>(())
+            })
+            .expect("retarget");
+        let second = fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("second");
+        assert_ne!(first.session_id, second.session_id);
+        assert!(first_closed.load(Ordering::SeqCst));
+        assert_eq!(dialer.calls(), 2);
+        assert_eq!(fixture.registry.list().expect("list")[0].name, "renamed");
+        assert!(!format!("{second:?}").contains("hunter2-secret"));
+    }
+
+    #[tokio::test]
+    async fn a_case_only_host_change_reuses_the_session_and_refreshes_the_name() {
+        let fixture = fixture("password", None);
+        save_password(&fixture, "hunter2-secret");
+        let dialer = ScriptedDialer::new(vec![Script::Connected]);
+        let first = fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("first");
+        fixture
+            .database
+            .with_connection(|connection| {
+                connection
+                    .execute(
+                        "UPDATE connections SET host = 'example.com', name = 'renamed' WHERE id = ?1",
+                        [&fixture.connection_id],
+                    )
+                    .map_err(|_| SessionError::Database)?;
+                Ok::<(), SessionError>(())
+            })
+            .expect("rename");
+        let second = fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("reuse");
+        assert_eq!(first.session_id, second.session_id);
+        assert_eq!(dialer.calls(), 1);
+        assert_eq!(fixture.registry.list().expect("list")[0].name, "renamed");
+        assert_eq!(
+            fixture.registry.list().expect("list")[0].host,
+            "Example.COM"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_connection_closes_its_session() {
+        let fixture = fixture("password", None);
+        save_password(&fixture, "hunter2-secret");
+        let dialer = ScriptedDialer::new(vec![Script::Connected]);
+        fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect("connect");
+        let closed = dialer
+            .last_closed
+            .lock()
+            .expect("closed")
+            .clone()
+            .expect("link");
+        fixture
+            .registry
+            .delete_connection(&fixture.database, &fixture.connection_id)
+            .await
+            .expect("delete");
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(fixture.registry.list().expect("empty").is_empty());
+        let gone = fixture
+            .registry
+            .connect(
+                &dialer,
+                &fixture.database,
+                &fixture.vault,
+                &fixture.hosts,
+                &fixture.connection_id,
+            )
+            .await
+            .expect_err("deleted");
+        assert!(matches!(gone, SessionError::NotFound));
+        assert_eq!(dialer.calls(), 1);
+    }
+
     #[tokio::test]
     async fn concurrent_connect_dials_once() {
         let fixture = fixture("password", None);
@@ -996,7 +1285,15 @@ mod tests {
         let command = CommandError::from(error);
         assert_eq!(command.code, "host_key_unknown");
         assert!(command.message.contains(&fingerprint(b"key-a")));
+        assert_eq!(
+            command
+                .prompt
+                .as_ref()
+                .map(|prompt| prompt.fingerprint.as_str()),
+            Some(fingerprint(b"key-a").as_str())
+        );
         assert!(!command.message.contains("hunter2-secret"));
+        assert!(!format!("{:?}", command.prompt).contains("hunter2-secret"));
         assert!(fixture.registry.list().expect("list").is_empty());
         let stored: i64 = fixture
             .database
@@ -1072,6 +1369,7 @@ mod tests {
                 &fixture.connection_id,
                 "SHA256:not-the-key",
             )
+            .await
             .expect_err("mismatch");
         assert!(matches!(mismatch, SessionError::InvalidHostKey));
         assert_eq!(dialer.calls(), 1);
@@ -1084,7 +1382,19 @@ mod tests {
                 &fixture.connection_id,
                 &fingerprint(b"key-b"),
             )
+            .await
             .expect("replace");
+        let again = fixture
+            .registry
+            .trust_host(
+                &fixture.database,
+                &fixture.hosts,
+                &fixture.connection_id,
+                &fingerprint(b"key-b"),
+            )
+            .await
+            .expect_err("pending is consumed");
+        assert!(matches!(again, SessionError::NothingToTrust));
         let replaced: String = fixture
             .database
             .with_connection(|connection| {

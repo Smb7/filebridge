@@ -133,6 +133,18 @@ pub(crate) fn touch_used(
     repo::touch_used(connection, id)
 }
 
+pub(crate) enum RemoveError {
+    NotFound,
+    Database,
+}
+
+pub(crate) fn remove(connection: &rusqlite::Connection, id: &str) -> Result<(), RemoveError> {
+    repo::delete(connection, id).map_err(|error| match error {
+        repo::RepoError::NotFound => RemoveError::NotFound,
+        repo::RepoError::Database(_) => RemoveError::Database,
+    })
+}
+
 #[tauri::command]
 pub fn connections_list(
     database: tauri::State<'_, Database>,
@@ -151,11 +163,14 @@ pub fn connections_save(
 }
 
 #[tauri::command]
-pub fn connections_delete(
+pub async fn connections_delete(
     database: tauri::State<'_, Database>,
+    sessions: tauri::State<'_, crate::session::SessionState>,
     id: String,
 ) -> Result<(), CommandError> {
-    database.with_connection(|connection| repo::delete(connection, &id).map_err(CommandError::from))
+    // Close any live SSH session under the same lock that connect uses, then
+    // delete the row. Otherwise a connect in flight can revive a deleted server.
+    sessions.delete_connection(&database, &id).await
 }
 
 #[cfg(test)]

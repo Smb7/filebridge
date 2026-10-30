@@ -10,6 +10,8 @@ use super::sftp::SftpGate;
 use super::{DialError, DialTarget, Dialer, PreparedAuth, RemoteLink, matches_trusted_key};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const SFTP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_KEY_BYTES: u64 = 256 * 1024;
 
 enum Rejection {
@@ -61,64 +63,93 @@ pub struct RusshDialer;
 impl Dialer for RusshDialer {
     async fn dial(&self, target: DialTarget) -> Result<Arc<dyn RemoteLink>, DialError> {
         let rejected = Arc::new(Mutex::new(None));
-        let handler = KeyHandler {
-            known: target.known_keys,
-            rejected: rejected.clone(),
-        };
-        let config = Arc::new(client::Config {
-            inactivity_timeout: None,
-            nodelay: true,
-            ..client::Config::default()
-        });
-        let connect = client::connect(config, (target.host.as_str(), target.port), handler);
-        let mut handle = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-            Ok(Ok(handle)) => handle,
-            Ok(Err(_)) | Err(_) => return Err(take_rejection(&rejected)),
-        };
-
-        if let Err(error) = authenticate(&mut handle, &target.username, target.auth).await {
-            let _ = handle
-                .disconnect(russh::Disconnect::ByApplication, "", "")
-                .await;
-            return Err(error);
+        let rejected_for_timeout = rejected.clone();
+        // The handshake, authentication, and SFTP startup share one deadline.
+        // A server that accepts TCP and then stalls must not hold the session lock.
+        match tokio::time::timeout(CONNECT_TIMEOUT, open_link(target, rejected)).await {
+            Ok(result) => result,
+            Err(_) => Err(take_rejection(&rejected_for_timeout)),
         }
+    }
+}
 
-        let channel = match handle.channel_open_session().await {
-            Ok(channel) => channel,
-            Err(_) => {
-                let _ = handle
-                    .disconnect(russh::Disconnect::ByApplication, "", "")
-                    .await;
-                return Err(DialError::Sftp);
-            }
+async fn open_link(
+    target: DialTarget,
+    rejected: Arc<Mutex<Option<Rejection>>>,
+) -> Result<Arc<dyn RemoteLink>, DialError> {
+    let handler = KeyHandler {
+        known: target.known_keys,
+        rejected: rejected.clone(),
+    };
+    let config = Arc::new(client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        keepalive_max: 3,
+        nodelay: true,
+        ..client::Config::default()
+    });
+    let mut handle =
+        match client::connect(config, (target.host.as_str(), target.port), handler).await {
+            Ok(handle) => handle,
+            Err(_) => return Err(take_rejection(&rejected)),
         };
-        if channel.request_subsystem(true, "sftp").await.is_err() {
+
+    if let Err(error) = authenticate(&mut handle, &target.username, target.auth).await {
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await;
+        return Err(error);
+    }
+
+    let channel = match handle.channel_open_session().await {
+        Ok(channel) => channel,
+        Err(_) => {
             let _ = handle
                 .disconnect(russh::Disconnect::ByApplication, "", "")
                 .await;
             return Err(DialError::Sftp);
         }
-        let sftp = match SftpSession::new(channel.into_stream()).await {
-            Ok(sftp) => sftp,
-            Err(_) => {
-                let _ = handle
-                    .disconnect(russh::Disconnect::ByApplication, "", "")
-                    .await;
-                return Err(DialError::Sftp);
-            }
-        };
-        let link = Arc::new(RusshLink {
-            handle: tokio::sync::Mutex::new(handle),
-            sftp: tokio::sync::Mutex::new(sftp),
-            gate: SftpGate::new(),
-            closed: std::sync::atomic::AtomicBool::new(false),
-        });
-        if let Err(error) = link.probe_root().await {
-            link.close().await;
-            return Err(error);
-        }
-        Ok(link)
+    };
+    if channel.request_subsystem(true, "sftp").await.is_err() {
+        let _ = handle
+            .disconnect(russh::Disconnect::ByApplication, "", "")
+            .await;
+        return Err(DialError::Sftp);
     }
+    let sftp = match SftpSession::new(channel.into_stream()).await {
+        Ok(sftp) => sftp,
+        Err(_) => {
+            let _ = handle
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+            return Err(DialError::Sftp);
+        }
+    };
+    let link = Arc::new(RusshLink {
+        handle: tokio::sync::Mutex::new(handle),
+        sftp: tokio::sync::Mutex::new(sftp),
+        gate: SftpGate::new(),
+        closed: std::sync::atomic::AtomicBool::new(false),
+    });
+    // Listing "/" fails for chrooted and restricted accounts, so a refused
+    // realpath does not fail the connection. A hang still means SFTP is unusable.
+    if tokio::time::timeout(SFTP_PROBE_TIMEOUT, probe_sftp(&link.sftp, &link.gate))
+        .await
+        .is_err()
+    {
+        link.close().await;
+        return Err(DialError::Sftp);
+    }
+    Ok(link)
+}
+
+async fn probe_sftp(sftp: &tokio::sync::Mutex<SftpSession>, gate: &SftpGate) {
+    let _ = gate
+        .run("/", |path| async move {
+            let sftp = sftp.lock().await;
+            let _ = sftp.canonicalize(&path).await;
+        })
+        .await;
 }
 
 fn take_rejection(rejected: &Mutex<Option<Rejection>>) -> DialError {
@@ -222,19 +253,6 @@ struct RusshLink {
     closed: std::sync::atomic::AtomicBool,
 }
 
-impl RusshLink {
-    async fn probe_root(&self) -> Result<(), DialError> {
-        self.gate
-            .run("/", |path| async move {
-                let sftp = self.sftp.lock().await;
-                sftp.read_dir(&path).await.map(|_| ()).map_err(|_| ())
-            })
-            .await
-            .map_err(|_| DialError::Sftp)?
-            .map_err(|_| DialError::Sftp)
-    }
-}
-
 impl RemoteLink for RusshLink {
     fn is_closed(&self) -> bool {
         if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -267,5 +285,19 @@ mod tests {
         let error = decode_identity(secret, Some("hunter2-secret")).expect_err("garbage");
         let message = format!("{error:?}");
         assert!(!message.contains("hunter2-secret"));
+    }
+
+    #[test]
+    fn stored_host_key_fingerprint_matches_openssh() {
+        let public = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+        )
+        .expect("public key");
+        let bytes = public.to_bytes().expect("wire bytes");
+        let openssh = public.fingerprint(russh::keys::HashAlg::Sha256).to_string();
+        assert_eq!(public.algorithm().as_str(), "ssh-ed25519");
+        assert_eq!(crate::known_hosts::fingerprint(&bytes), openssh);
+        assert!(openssh.starts_with("SHA256:"));
+        assert!(!openssh.contains("hunter2-secret"));
     }
 }

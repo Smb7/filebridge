@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   blankToNull,
   hostKeyPromptCopy,
+  bindHostPrompt,
   isAppError,
   isHostKeyStop,
+  promptFromConnectError,
   keyPathForMethod,
   planCredentialWrite,
   secretFromFields,
@@ -129,6 +131,43 @@ describe("live sessions", () => {
     expect(isHostKeyStop("host_key_changed")).toBe(true);
     expect(isHostKeyStop("auth_failed")).toBe(false);
     expect(isHostKeyStop("vault_locked")).toBe(false);
+  });
+
+  it("binds a host-key prompt to the connection that was connecting", () => {
+    const prompt = {
+      pendingId: "pending-1",
+      host: "10.0.0.8",
+      port: 22,
+      keyType: "ssh-ed25519",
+      fingerprint: "SHA256:abc",
+      storedFingerprint: "SHA256:old",
+      decision: "changed" as const,
+    };
+    expect(bindHostPrompt("conn-1", prompt)).toEqual({
+      ...prompt,
+      connectionId: "conn-1",
+    });
+    expect(bindHostPrompt(null, prompt)).toBeNull();
+    expect(bindHostPrompt("conn-1", undefined)).toBeNull();
+    expect(
+      promptFromConnectError("conn-1", {
+        code: "host_key_changed",
+        message: "The host key changed. Trust was not replaced. SHA256:abc",
+        prompt,
+      }),
+    ).toEqual({ ...prompt, connectionId: "conn-1" });
+    expect(
+      promptFromConnectError("conn-1", {
+        code: "auth_failed",
+        message: "Authentication failed.",
+      }),
+    ).toBeNull();
+    expect(
+      promptFromConnectError("conn-2", {
+        code: "host_key_unknown",
+        message: "This host key has not been trusted yet.",
+      }),
+    ).toBeNull();
   });
 });
 

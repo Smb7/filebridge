@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 export type AppError = {
   code: string;
   message: string;
+  prompt?: HostKeyPrompt;
 };
 
 export type AuthMethod = "password" | "private_key" | "key_file" | "agent";
@@ -259,6 +260,31 @@ export function sessionForConnection(
 
 export function isHostKeyStop(code: string): boolean {
   return code === "host_key_unknown" || code === "host_key_changed";
+}
+
+export type BoundHostPrompt = HostKeyPrompt & {
+  connectionId: string;
+};
+
+/** Keep the confirm action on the connection that was connecting, not whichever row is selected later. */
+export function bindHostPrompt(
+  connectionId: string | null,
+  prompt: HostKeyPrompt | null | undefined,
+): BoundHostPrompt | null {
+  if (!connectionId || !prompt?.fingerprint) {
+    return null;
+  }
+  return { ...prompt, connectionId };
+}
+
+export function promptFromConnectError(
+  connectionId: string | null,
+  error: unknown,
+): BoundHostPrompt | null {
+  if (!isAppError(error) || !isHostKeyStop(error.code)) {
+    return null;
+  }
+  return bindHostPrompt(connectionId, error.prompt);
 }
 
 export function sessionConnect(
