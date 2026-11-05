@@ -14,7 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 aes-gcm = "0.10"
-argon2 = "0.5"
+argon2 = "0.6"
 base64 = "0.22"
 getrandom = "0.4"
 # Platform features are required. keyring 3 has no default store; without these
