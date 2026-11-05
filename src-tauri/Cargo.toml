@@ -15,7 +15,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 aes-gcm = "0.10"
 argon2 = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.4"
 # Platform features are required. keyring 3 has no default store; without these
 # it uses an in-memory mock, so a keychain DEK would vanish on the next launch.
